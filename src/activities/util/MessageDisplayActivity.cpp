@@ -3,6 +3,8 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 
+#include "network/MessageSync.h"
+
 namespace {
 constexpr const char* MESSAGE_FRAME_PATH = "/.love-notes/current.frame";
 }
@@ -36,6 +38,8 @@ void MessageDisplayActivity::onEnter() {
   }
 
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+  // Dedup: record this note's id so it will not reshow on the next wake.
+  MessageSync::markCurrentNoteShown();
 }
 
 void MessageDisplayActivity::loop() {

@@ -313,11 +313,17 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "removeReadBooksFromRecents", StrId::STR_CAT_SYSTEM),
         SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_MESSAGE_SYNC, &CrossPointSettings::messageSyncEnabled, "messageSyncEnabled",
+                            StrId::STR_CAT_SYSTEM),
 
         // OPDS download folder: persisted + web-exposed, but category-less so it
         // is hidden from the on-device Settings screen (edited via OPDS UI).
         SettingInfo::String(StrId::STR_OPDS_DOWNLOAD_FOLDER, &SETTINGS.opdsDownloadFolder[0],
                             sizeof(SETTINGS.opdsDownloadFolder), "opdsDownloadFolder"),
+        // Message-sync mailbox base URL: persisted + web-exposed, category-less
+        // so it stays off the on-device Settings screen (edited via web UI).
+        SettingInfo::String(StrId::STR_MESSAGE_SYNC_URL, &SETTINGS.messageSyncUrl[0], sizeof(SETTINGS.messageSyncUrl),
+                            "messageSyncUrl"),
         // OPDS download filename format: persisted + web-exposed, category-less so it
         // is hidden from the on-device Settings screen (cycled from the OPDS UI).
         SettingInfo::Enum(StrId::STR_OPDS_FILENAME_FORMAT, &CrossPointSettings::opdsFilenameFormat,

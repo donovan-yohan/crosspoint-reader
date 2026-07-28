@@ -32,6 +32,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
+#include "network/MessageSync.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -213,6 +214,15 @@ void enterDeepSleep(bool fromTimeout = false) {
     saveSleepFrameBuffer();
   }
 
+  // M2 #1 (messenger): sleep-sync. goToSleep() above already painted the sleep
+  // screen (blocking e-ink refresh), so the bounded WiFi window is hidden from
+  // the user who walked away. Only reached for a real reading-session sleep: the
+  // go-back-to-sleep gates in setup() call startDeepSleep() directly and never
+  // enter here. Deep sleep fully resets the chip, so the post-WiFi fragmented
+  // heap is discarded on the next wake -- no silentRestart needed. syncBeforeSleep
+  // leaves WiFi off; the teardown below is a safety net.
+  MessageSync::syncBeforeSleep(display.getBufferSize());
+
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
   if (WiFi.getMode() != WIFI_MODE_NULL) {
@@ -308,18 +318,20 @@ void setup() {
 
   SETTINGS.loadFromFile();
 
-  // Milestone 1 (messenger): if a love-note frame is staged on the SD card,
-  // queue it as a Push now — currentActivity is still null here, so it lands on
-  // top of whatever the routing below selects and Back dismisses back to it.
-  // The goToBoot() splash calls below are skipped when a note is staged so they
-  // cannot clobber this single-slot pending Push, making the note the first
-  // screen shown. Normal boot is unchanged when no note is staged.
-  const bool showLoveNote = Storage.exists("/.love-notes/current.frame");
+  APP_STATE.loadFromFile();
+
+  // Milestone 1/2 (messenger): if an UNREAD love-note frame is staged, queue it
+  // now as a deferred Push (currentActivity is null here, so it lands on top of
+  // the routing target below and Back dismisses to it). MessageSync::hasUnreadNote
+  // dedups by message id so a note shows exactly once, never on every wake (fixes
+  // a latent M1 bug). APP_STATE must be loaded first for the id comparison. The
+  // goToBoot() splash calls below are skipped when showLoveNote, so the note is
+  // the first screen shown.
+  const bool showLoveNote = MessageSync::hasUnreadNote();
   if (showLoveNote) {
     activityManager.goToMessage();
   }
 
-  APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
