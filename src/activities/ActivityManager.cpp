@@ -18,6 +18,7 @@
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
 #include "util/FullScreenMessageActivity.h"
+#include "util/MessageDisplayActivity.h"
 
 static portMUX_TYPE activityManagerSpinlock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -221,6 +222,12 @@ void ActivityManager::goToBoot() { replaceActivity(std::make_unique<BootActivity
 
 void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::Style style) {
   replaceActivity(std::make_unique<FullScreenMessageActivity>(renderer, mappedInput, std::move(message), style));
+}
+
+void ActivityManager::goToMessage() {
+  // pushActivity (not replaceActivity) keeps the underlying activity on the
+  // stack so MessageDisplayActivity::finish() returns to it.
+  pushActivity(std::make_unique<MessageDisplayActivity>(renderer, mappedInput));
 }
 
 void ActivityManager::goHome(HomeMenuItem initialMenuItem) {

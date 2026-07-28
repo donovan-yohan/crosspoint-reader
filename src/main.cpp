@@ -307,6 +307,18 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+
+  // Milestone 1 (messenger): if a love-note frame is staged on the SD card,
+  // queue it as a Push now — currentActivity is still null here, so it lands on
+  // top of whatever the routing below selects and Back dismisses back to it.
+  // The goToBoot() splash calls below are skipped when a note is staged so they
+  // cannot clobber this single-slot pending Push, making the note the first
+  // screen shown. Normal boot is unchanged when no note is staged.
+  const bool showLoveNote = Storage.exists("/.love-notes/current.frame");
+  if (showLoveNote) {
+    activityManager.goToMessage();
+  }
+
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
@@ -396,12 +408,12 @@ void setup() {
         } else {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
-      } else {
+      } else if (!showLoveNote) {
         activityManager.goToBoot();  // frame file missing, fall back to the splash
       }
       break;
     case BootResume::Splash:
-      activityManager.goToBoot();
+      if (!showLoveNote) activityManager.goToBoot();
       break;
   }
 

@@ -90,6 +90,9 @@ class ActivityManager {
   void goToSleep(bool fromTimeout = false);
   void goToBoot();
   void goToFullScreenMessage(std::string message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
+  // Milestone 1 (messenger): push a MessageDisplayActivity on top of the
+  // current activity so dismissing it returns to the underlying reader/home.
+  void goToMessage();
   void goToCrashReport();
   void goHome(HomeMenuItem initialMenuItem = HomeMenuItem::NONE);
 
