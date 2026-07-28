@@ -707,15 +707,12 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     if (!filePath.endsWith("/")) filePath += "/";
     filePath += state.fileName;
 
-    // Check if file already exists - SD operations can be slow
-    resetTaskWatchdogIfSubscribed();
-    if (Storage.exists(filePath.c_str())) {
-      state.error = "File already exists: " + state.fileName;
-      LOG_DBG("WEB", "[UPLOAD] Collision: %s", filePath.c_str());
-      return;
-    }
-
-    // Open file for writing - this can be slow due to FAT cluster allocation
+    // Open file for writing. openFileForWrite opens with O_TRUNC, so this
+    // overwrites any existing file - senders can upload straight over a file
+    // (e.g. /.love-notes/current.frame) without a prior delete. A partial write
+    // from an interrupted upload leaves a truncated file, which the love-note
+    // reader rejects via its exact-size (52272 byte) check, same as before.
+    // This can be slow due to FAT cluster allocation.
     resetTaskWatchdogIfSubscribed();
     if (!Storage.openFileForWrite("WEB", filePath, state.file)) {
       state.error = "Failed to create file on SD card";
