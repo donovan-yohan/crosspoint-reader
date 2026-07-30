@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 // M2 #3 (messenger): epub delivery through the same mailbox as the love notes.
@@ -45,7 +46,31 @@ namespace BookSync {
 // Never turns WiFi off (the caller owns the radio) and never blocks beyond
 // `deadline` plus one SD promote. Returns true iff a book was promoted into
 // /books by this call.
-bool syncOnLink(const std::string& base, uint32_t deadline);
+//
+// `progress` exists for a FOREGROUND caller that has a screen and a Back button
+// (contract appendix A4's live-sync mode); the unattended sleep-entry window
+// passes nothing and behaves exactly as before. Both members are optional.
+struct Progress {
+  // Called at most once per syncOnLink(), after the manifest diff has picked a
+  // target and before the first byte of it is requested, so a progress screen can
+  // name the book it is about to spend a window on. `have` is what previous
+  // windows already staged, so a resuming caller can show "1.2 of 4.0 MB" without
+  // this unit growing a per-chunk hook -- deliberately absent, because the panel
+  // has no partial refresh and a repaint per chunk would be 1720 ms of e-ink per
+  // chunk (A4 "Render -- repaint on state change, never per poll").
+  std::function<void(const std::string& filename, size_t bytes, size_t have)> onTarget;
+
+  // Polled while bytes flow. Return true to abandon THIS window; the partial is
+  // kept and the next window resumes from it, which is the same outcome as the
+  // deadline expiring mid-body. It exists so Back stays responsive during a
+  // multi-megabyte transfer instead of waiting out the window budget: the caller
+  // is blocked inside this function for the whole window, so nothing else can
+  // observe the button. Called from HttpDownloader's progress path, which is
+  // per-chunk but only fires when the server reported a body size -- so it is a
+  // latency improvement, never the bound. `deadline` remains the only guarantee.
+  std::function<bool()> shouldAbort;
+};
+bool syncOnLink(const std::string& base, uint32_t deadline, const Progress& progress = {});
 
 // Transfer budget for one window, contract section 3 "Byte budgets": at the
 // measured 30 KB/s pessimistic floor, 20 s puts a 400 KiB novel in one window

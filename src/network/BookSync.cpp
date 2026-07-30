@@ -375,7 +375,7 @@ bool promote(const ManifestEntry& entry, const std::string& part, const std::str
 // keeps: a book that has been evicted server-side, or that the manifest never
 // named, stays exactly where it is. /books is user space and the reader is the
 // only party that knows what is in it.
-bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline) {
+bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline, const Progress& progress) {
   if (base.empty()) return false;
   if (remainingMs(deadline) < static_cast<int32_t>(MIN_USEFUL_MS)) {
     LOG_DBG("BSYNC", "skipping books window: %d ms left", static_cast<int>(remainingMs(deadline)));
@@ -414,6 +414,25 @@ bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline) {
       return false;
     }
 
+    // Name the target before the first byte, so a foreground caller's screen says
+    // what it is doing rather than going quiet for a window. Fires only on the
+    // path that is about to spend budget: a book already at its full size falls
+    // straight through to promote() below and there is nothing to report.
+    if (progress.onTarget) progress.onTarget(entry.filename, entry.bytes, have);
+
+    // A user-requested abort is delivered as HttpDownloader's cancelFlag, which
+    // sinkExpired() polls in the body read loop -- the same place the deadline is
+    // polled, so it lands in the ABORTED case below and is handled by the existing
+    // "the bytes so far are good, keep the partial" rule. Nothing about resume
+    // changes: an aborted window is a short window.
+    bool aborted = false;
+    HttpDownloader::ProgressCallback abortTick;
+    if (progress.shouldAbort) {
+      abortTick = [&aborted, &progress](size_t, size_t) {
+        if (!aborted && progress.shouldAbort()) aborted = true;
+      };
+    }
+
     // At most two attempts, and the second one ONLY for an ignored Range: a
     // server behind a range-stripping proxy answers 200 with the whole body, which
     // delivers no bytes at all at a resume offset. Discarding the partial and
@@ -441,8 +460,8 @@ bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline) {
       }
       LOG_INF("BSYNC", "Fetching %s from %u/%u B", entry.id.c_str(), static_cast<unsigned>(have),
               static_cast<unsigned>(entry.bytes));
-      const HttpDownloader::RangeResult result =
-          HttpDownloader::resumeToFile(base + SUFFIX_BOOK + entry.id, part, have, deadline);
+      const HttpDownloader::RangeResult result = HttpDownloader::resumeToFile(
+          base + SUFFIX_BOOK + entry.id, part, have, deadline, abortTick, abortTick ? &aborted : nullptr);
 
       // The ONE signal available that the bytes changed underneath a resume: the
       // total the server reports versus the size the manifest advertised.
@@ -455,7 +474,7 @@ bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline) {
 
       switch (result.error) {
         case HttpDownloader::OK:
-        case HttpDownloader::ABORTED:  // deadline reached mid-body: the bytes so far are good
+        case HttpDownloader::ABORTED:  // deadline hit, or the caller asked to stop: bytes so far are good
           transferred = true;
           break;
         case HttpDownloader::RANGE_NOT_SATISFIABLE:
