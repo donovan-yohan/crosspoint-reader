@@ -10,6 +10,9 @@ class SleepActivity final : public Activity {
   void onEnter() override;
 
  private:
+  // M2 #2: paints the staged mailbox note as the lock screen. Returns false when
+  // there is no usable note, in which case the wallpaper mode below runs instead.
+  bool renderNoteSleepScreen() const;
   void renderDefaultSleepScreen() const;
   void renderCustomSleepScreen() const;
   void renderCoverSleepScreen() const;

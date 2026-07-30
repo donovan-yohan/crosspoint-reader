@@ -16,6 +16,7 @@
 #include "fontIds.h"
 #include "images/Logo120.h"
 #include "images/MoonIcon.h"
+#include "network/MessageSync.h"
 
 void SleepActivity::onEnter() {
   Activity::onEnter();
@@ -38,6 +39,15 @@ void SleepActivity::onEnter() {
     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
   }
 
+  // M2 #2 (messenger, contract section 3A): the newest staged note IS the lock
+  // screen, so this sits ahead of EVERY wallpaper mode -- a note must lock the
+  // screen for a user on DARK or COVER too, not just CUSTOM. Wallpaper is the
+  // no-note-exists fallback only, and the note stays the lock until a newer note
+  // replaces it (no timer, no read-tracking, no revert). Quick-resume sleeps
+  // returned above and are deliberately left alone: "put the screen back exactly
+  // as it was" wins, and the note becomes the lock at the next normal sleep.
+  if (renderNoteSleepScreen()) return;
+
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
       return renderBlankSleepScreen();
@@ -54,6 +64,22 @@ void SleepActivity::onEnter() {
     default:
       return renderDefaultSleepScreen();
   }
+}
+
+// Raw full-panel blit of the staged note. current.frame is byte-identical in
+// shape to the live framebuffer -- that is the whole point of the contract -- so
+// this costs no second ~51 KB allocation, and a size mismatch just falls through
+// to the wallpaper without deleting anything.
+//
+// HALF, not FULL: every sleep screen in this file paints with a single HALF
+// refresh because the OEM firmware's only clean refresh in normal operation is
+// the single-pass 0xD7 sequence. MessageDisplayActivity uses FULL_REFRESH because
+// it is a foreground activity; the lock screen must not.
+bool SleepActivity::renderNoteSleepScreen() const {
+  if (!MessageSync::loadStagedNote(renderer.getFrameBuffer(), renderer.getBufferSize())) return false;
+  LOG_DBG("SLP", "Sleep screen: staged mailbox note");
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  return true;
 }
 
 void SleepActivity::renderCustomSleepScreen() const {
