@@ -1,0 +1,180 @@
+#pragma once
+
+#include <I18nKeys.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <string>
+
+#include "activities/Activity.h"
+
+// M2 #3 / M3: the user-initiated mailbox drain. Contract appendix A4 (live sync
+// over a saved network) and appendix A3 (the same loop with a phone acting as the
+// mailbox's front door on the reader's own AP).
+//
+// ONE ACTIVITY, TWO TRANSPORTS, AND A4 IS EMPHATIC THAT THEY MUST NOT FORK. The
+// link comes up differently -- a headless STA connect to a saved network, or a
+// softAP the phone joins -- and after that every single thing is identical: the
+// same poll cadence, the same MessageSync::syncOnLink, the same
+// BookSync::syncOnLink, the same staging, the same progress screen, the same
+// session cap, the same teardown. `Transport` selects a base URL and nothing else.
+//
+// WHAT THE USER SEES, AND WHAT THEY DELIBERATELY DO NOT. Books land in /books and
+// are readable the moment the mode exits, because a book is a file in a library.
+// A note does NOT render here: the lock-screen model (contract 3A) is
+// unconditional, so a note staged during a sync becomes the sleep screen at the
+// next sleep-entry and the progress screen only says that it did. Rendering it
+// inline would reintroduce exactly the interrupting-note model 3A deleted.
+//
+// REPAINT ON STATE CHANGE, NEVER PER POLL. There is no partial-refresh path
+// exposed to activities (GfxRenderer::displayWindow is commented out), so every
+// paint is a full frame and a HALF refresh is 1720 ms. A screen that ticked once
+// per 4 s poll would be ~450 full-frame refreshes in a capped session -- a
+// strobing panel, most of a second in every four spent refreshing, for no
+// information. paintIfChanged() is the only paint call site and it compares a
+// signature of everything the screen shows, so "repaint only on a transition" is
+// structural here rather than a rule someone has to remember.
+namespace MailboxSync {
+
+// Poll cadence. Both polls are tiny by contract -- latest.txt is <= 128 B and
+// books.txt is capped at 8192 B on the reader -- so a round trip is ~4 KB of
+// payload, which is the only reason 4 s is affordable at all.
+//
+// ON THE STA TRANSPORT THIS IS STILL EXPENSIVE, AND IT IS A KNOWN GAP.
+// SecureHttpClient is stack-local inside HttpDownloader's hop loop, so keep-alive
+// is dead across calls (contract 5 G6): every poll pays two fresh TLS handshakes
+// for those 4 KB. A3's peer link has no handshake at all -- it is plain HTTP,
+// TLS terminates on the phone -- so G6 is a constraint on the internet transport
+// only, and the peer transport is the one this cadence was chosen for.
+constexpr uint32_t POLL_INTERVAL_MS = 4000;
+
+// Hard session cap, a safety net rather than a budget: the mode holds the radio
+// up and preventAutoSleep() asserted for its whole life, so it must not be able
+// to outlive a user who walked away. Enforced against an absolute millis()
+// deadline in the loop, never against the 60 s per-socket-op timeout (5 G7).
+constexpr uint32_t SESSION_CAP_MS = 30UL * 60UL * 1000UL;
+
+// How long the AP transport waits for a phone to associate before giving up, and
+// how long it then spends looking for the forwarder among the DHCP leases. The
+// join wait is generous because it includes a human: unlocking a phone, opening
+// the app, accepting the system join dialog.
+constexpr uint32_t PHONE_JOIN_WAIT_MS = 120000;
+constexpr uint32_t PEER_DISCOVERY_MS = 8000;
+
+enum class Transport : uint8_t {
+  // Appendix A4: headless connect to a saved network (the canonical one being the
+  // user's own phone hotspot), base = the configured mailbox URL.
+  SavedNetwork,
+  // Appendix A3: raise the reader's own AP -- WITHOUT the web server, so nothing
+  // on the reader is writable from the peer link -- and speak the contract at the
+  // phone's forwarder. Base = http://{peerIp}:8080 + the path of the configured URL.
+  PhoneAp,
+};
+
+}  // namespace MailboxSync
+
+class MailboxSyncActivity final : public Activity {
+ public:
+  MailboxSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, MailboxSync::Transport transport)
+      : Activity("MailboxSync", renderer, mappedInput), transport(transport) {}
+
+  void onEnter() override;
+  void onExit() override;
+  void loop() override;
+  void render(RenderLock&&) override;
+
+  // Asserted for the whole live session. The inactivity timer would otherwise
+  // sleep the device mid-drain; the precedent is MessageSync's wake check, which
+  // sits in the same condition at main.cpp for exactly this reason.
+  //
+  // RELEASED once the session is over -- cap spent or failed -- because those
+  // states are terminal, the radio is already down, and they wait on the user
+  // pressing Back. Holding the device awake indefinitely on a screen nobody is
+  // reading would reintroduce the battery drain the session cap exists to prevent,
+  // for a user who has walked away.
+  bool preventAutoSleep() override;
+
+ private:
+  // The screen, and therefore the paint trigger. Every transition below is a
+  // full-frame repaint and nothing else is.
+  enum class State : uint8_t {
+    Connecting,    // STA: associating with a saved network. AP: raising the softAP.
+    WaitingPhone,  // AP only: AP is up, SSID + PSK on the panel, no station yet.
+    Linking,       // AP only: a station joined; probing the leases for the forwarder.
+    Polling,       // Link up, base known, nothing in flight.
+    Receiving,     // A book window is running; targetName is on the panel.
+    Stalled,       // Consecutive failed polls. Still trying -- not an exit.
+    Failed,        // Terminal. failureText says why; Back is the only way out.
+    Finished,      // Session cap spent. Shows the counts.
+  };
+
+  const MailboxSync::Transport transport;
+
+  State state = State::Connecting;
+  std::string base;         // Empty until the link is up and the base is composed.
+  std::string apSsid;       // AP transport only, shown on the panel.
+  std::string apPsk;        // AP transport only, shown on the panel. Session-scoped.
+  std::string targetName;   // Book currently being received, for the Receiving state.
+  size_t targetBytes = 0;   // ...and its size, so the panel can show "1.2 / 4.0 MB".
+  size_t targetHave = 0;
+  StrId failureText = StrId::STR_SYNC_FINISHED;  // Meaningful only in State::Failed.
+
+  int notesStaged = 0;
+  int booksReceived = 0;
+
+  uint32_t sessionDeadline = 0;  // Absolute millis(); set once the activity starts.
+  uint32_t phoneWaitDeadline = 0;
+  uint32_t nextPollAt = 0;
+  uint32_t lastAbortPoll = 0;  // Throttles the in-transfer Back sampling.
+  int consecutiveFailures = 0;
+
+  bool linkStarted = false;  // Guards the one-shot bring-up out of the first loop().
+  // Two separate facts, because they answer two different questions. `radioTouched`
+  // is "did any WiFi call happen", and it is what makes teardown unconditional on
+  // every exit path including a failed connect. `sessionRan` is "did a link
+  // actually come up and carry traffic", and it is what earns the silentRestart():
+  // a session that never associated has not fragmented the heap and rebooting the
+  // user out of the menu for it would be gratuitous.
+  bool radioTouched = false;
+  bool sessionRan = false;
+  bool exiting = false;       // Latched by Back (possibly from inside a download), so
+                              // nothing repaints on the way out.
+  bool finishCalled = false;  // finish() is idempotent from this activity's side.
+
+  // Everything the screen shows, folded into one comparable value. A paint happens
+  // iff this changed.
+  struct PaintSignature {
+    State state;
+    size_t nameHash;
+    size_t have;
+    int notes;
+    int books;
+    StrId failure;
+    bool operator==(const PaintSignature& o) const {
+      return state == o.state && nameHash == o.nameHash && have == o.have && notes == o.notes && books == o.books &&
+             failure == o.failure;
+    }
+  };
+  PaintSignature painted{State::Finished, 0, 0, -1, -1, StrId::STR_SYNC_FINISHED};
+
+  PaintSignature signature() const;
+  // The ONLY paint call site. Blocking (requestUpdateAndWait) so the panel really
+  // is showing the new state before the caller goes off and blocks on a socket.
+  void paintIfChanged();
+  void fail(StrId reason);
+
+  bool startSavedNetworkLink();
+  bool startPhoneApLink();
+  void stepPhoneApLink();  // WaitingPhone -> Linking -> Polling, and back on a drop.
+  void runPollCycle();
+  void teardownRadio();
+  // Polled from inside a book transfer so Back does not have to wait out the
+  // window budget. Latches `exiting`; the transfer unwinds through the existing
+  // "keep the partial" path.
+  bool pollForAbort();
+
+  void renderBody(int contentTop) const;
+  void renderPhoneJoinPanel(int contentTop) const;
+  const char* statusLine() const;
+};
