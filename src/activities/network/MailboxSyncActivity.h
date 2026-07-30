@@ -112,6 +112,13 @@ class MailboxSyncActivity final : public Activity {
   const MailboxSync::Transport transport;
 
   State state = State::Connecting;
+  // The configured mailbox URL, read from SETTINGS EXACTLY ONCE at link bring-up and
+  // never again -- appendix A3's structural requirement on A4. The AP transport
+  // needs it after entry (the peer base is only composable once a forwarder has been
+  // discovered, and is recomposed when the phone rejoins on a different lease), and
+  // this member is what it reads instead of going back to SETTINGS from inside the
+  // loop. The STA transport has no use for it: there the base IS the configured URL.
+  std::string configuredUrl;
   std::string base;         // Empty until the link is up and the base is composed.
   std::string apSsid;       // AP transport only, shown on the panel.
   std::string apPsk;        // AP transport only, shown on the panel. Session-scoped.
@@ -130,6 +137,13 @@ class MailboxSyncActivity final : public Activity {
   int consecutiveFailures = 0;
 
   bool linkStarted = false;  // Guards the one-shot bring-up out of the first loop().
+  // AP transport: "the panel has already said we are looking for the app on this
+  // link". Latched when the probe sweep is announced and cleared only by a sweep
+  // that succeeded, so a station that associates without ever answering /cp-proxy
+  // costs ONE repaint rather than one per retry. Together with the poll-cadence gate
+  // on re-discovery this is what keeps WaitingPhone <-> Linking from strobing the
+  // panel for a whole session -- see stepPhoneApLink().
+  bool probeAnnounced = false;
   // Two separate facts, because they answer two different questions. `radioTouched`
   // is "did any WiFi call happen", and it is what makes teardown unconditional on
   // every exit path including a failed connect. `sessionRan` is "did a link

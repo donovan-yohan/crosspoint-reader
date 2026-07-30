@@ -212,7 +212,20 @@ void MailboxSyncActivity::loop() {
 
   if (transport == Transport::PhoneAp) {
     stepPhoneApLink();
-    if (state != State::Polling && state != State::Receiving) {
+    // WHICH STATES ARE "THE LINK IS UP AND THE POLL MAY RUN". Stalled belongs in
+    // this list and leaving it out was a permanent dead-end: Stalled is a DISPLAY
+    // state ("polls are failing, still trying"), not a link state, and the only
+    // code that clears it is runPollCycle() -- so returning here on Stalled stopped
+    // the polls that are the sole way out of it, and the AP transport sat on
+    // "cannot reach the mailbox" for the rest of the session cap while the STA
+    // transport (which does not pass through this guard) kept polling. That is
+    // exactly the fork between the two transports A4 forbids.
+    //
+    // REGRESSION RULE: every new State must be classified here explicitly. A
+    // non-terminal state that can only be left by a successful poll MUST fall
+    // through; only states where there is genuinely no link to poll on
+    // (Connecting, WaitingPhone, Linking) may return.
+    if (state != State::Polling && state != State::Receiving && state != State::Stalled) {
       paintIfChanged();
       return;
     }
@@ -250,6 +263,12 @@ bool MailboxSyncActivity::startSavedNetworkLink() {
 }
 
 bool MailboxSyncActivity::startPhoneApLink() {
+  // Appendix A4's structural requirement, same as the STA path: SETTINGS is read
+  // ONCE, here, at entry. The AP path cannot pass the result straight into `base`
+  // the way the STA path can -- the peer base is only composable after discovery,
+  // and it is recomposed if the phone drops and rejoins on a different lease -- so
+  // it is held in `configuredUrl` and every later use reads that member. Nothing
+  // deeper in the loop calls MessageSync::configuredBase().
   const std::string configured = MessageSync::configuredBase();
   if (configured.empty()) {
     fail(StrId::STR_SYNC_NO_URL);
@@ -277,6 +296,22 @@ bool MailboxSyncActivity::startPhoneApLink() {
   //   4. a real PSK         -- see generatePsk().
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
+
+  // MODEM SLEEP: DECIDED HERE, NOT INHERITED. Skipping CrossPointWebServer::begin()
+  // also skips its WiFi.setSleep(false) (CrossPointWebServer.cpp:117-120, whose
+  // comment calls it critical for reliable operation), and A3 is explicit that a
+  // client-only AP mode must make this call itself rather than run on whatever the
+  // core's default happens to be. The choice is OFF, i.e. no modem sleep:
+  //   - the reader is the HTTP CLIENT on this link and issues a fresh request every
+  //     4 s, so sleep latency is paid on every poll of the whole session, not once;
+  //   - ESP-IDF power save is documented for station mode, so on an AP-only
+  //     interface the battery win is unproven while the latency cost is not;
+  //   - the battery bound for this mode is the 30-minute session cap plus the fact
+  //     that a foreground mode is watched by the user who started it -- not a power
+  //     mode that would trade poll reliability for an unmeasured saving.
+  // Revisit only with a number off a device (bracket the AP raise with the existing
+  // free-heap/current instrumentation), which is what A3 asks for.
+  WiFi.setSleep(false);
   delay(100);
 
   apSsid = AP_SSID;
@@ -291,7 +326,9 @@ bool MailboxSyncActivity::startPhoneApLink() {
 
   // Keep the configured base around; the peer base is composed from it the moment
   // discovery succeeds, and recomposed if the phone drops and rejoins on a
-  // different lease.
+  // different lease. This member is the ONLY copy the loop ever reads, and it is
+  // also why pathOf() is validated once above instead of on every sweep.
+  configuredUrl = configured;
   base.clear();
   state = State::WaitingPhone;
   phoneWaitDeadline = millis() + PHONE_JOIN_WAIT_MS;
@@ -325,9 +362,29 @@ void MailboxSyncActivity::stepPhoneApLink() {
       }
       return;
     }
+    // A STATION IS ASSOCIATED BUT UNPROVEN, AND THE RETRY IS ON THE POLL CADENCE.
+    // Re-discovery used to run on every loop() iteration, so a station that
+    // associates without answering /cp-proxy -- a phone that scanned the QR before
+    // opening the app, an app still binding its listener, a backgrounded app, or a
+    // stranger's device holding a lease -- drove WaitingPhone -> Linking -> failed
+    // sweep -> WaitingPhone with no gate at all. phoneWaitDeadline cannot bound that
+    // because it is only consulted while no station is present. Two full-frame
+    // repaints of two completely different layouts per attempt, forever: A4's
+    // strobing-panel finding, exactly.
+    if (static_cast<int32_t>(millis() - nextPollAt) < 0) return;
+
     LOG_INF("MSYNCUI", "A station joined; looking for the forwarder");
     state = State::Linking;
-    paintIfChanged();  // "Looking for the app..." before the probe sweep blocks
+    // "Looking for the app..." before the probe sweep blocks -- but ONCE per link,
+    // not once per retry. `probeAnnounced` latches here and is cleared only by a
+    // discovery that actually succeeded, so a station that never proves itself
+    // leaves the join panel (SSID, PSK, QR) on the screen, which is both the honest
+    // thing to show and a signature that stops changing: the retries below then cost
+    // zero refreshes.
+    if (!probeAnnounced) {
+      probeAnnounced = true;
+      paintIfChanged();
+    }
   }
 
   if (state == State::Linking) {
@@ -338,17 +395,26 @@ void MailboxSyncActivity::stepPhoneApLink() {
     // remembering to probe first.
     resetTaskWatchdogIfSubscribed();
     const std::string peer =
-        PeerProbe::discoverBase(MessageSync::configuredBase(), deadlineWithin(sessionDeadline, PEER_DISCOVERY_MS));
+        PeerProbe::discoverBase(configuredUrl, deadlineWithin(sessionDeadline, PEER_DISCOVERY_MS));
     if (peer.empty()) {
       // The station is associated but is not answering as a forwarder -- the app
       // is not open yet, or it is a device that just joined the network. Fall back
       // to waiting rather than failing: the phone is still there and the next
-      // poll cycle will try again.
+      // attempt will try again -- ON THE POLL CADENCE, which is what this line
+      // arms. Without it the WaitingPhone gate above lets the sweep re-run
+      // immediately and the panel strobes.
+      nextPollAt = millis() + POLL_INTERVAL_MS;
       state = State::WaitingPhone;
       return;
     }
     base = peer;
     state = State::Polling;
+    // A new link is a fresh start for the failure bookkeeping: carrying a spent
+    // consecutiveFailures across a re-link would drop the very next failed poll
+    // straight back into Stalled. Clearing probeAnnounced buys the next
+    // drop-and-rejoin its one "Looking for the app..." paint back.
+    consecutiveFailures = 0;
+    probeAnnounced = false;
     nextPollAt = millis();  // do not make the user wait a cadence for the first poll
     LOG_INF("MSYNCUI", "Peer link up");
     // Painted before the first poll rather than after it, or the panel would still
