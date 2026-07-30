@@ -5,6 +5,7 @@
 #include <Memory.h>
 #include <base64.h>
 
+#include <cstdlib>
 #include <functional>
 #include <string>
 
@@ -37,12 +38,44 @@ struct Sink {
   std::function<bool(const uint8_t*, size_t)> write;  // returns false to abort the transfer
   HttpDownloader::ProgressCallback progress;
   bool* cancelFlag = nullptr;
+  // Absolute millis() deadline for the whole transfer, 0 = unbounded. Polled in
+  // the same place as cancelFlag, which is inside the body read loop, so it
+  // bounds a socket that has stopped delivering bytes as well as a slow one.
+  uint32_t deadlineMs = 0;
+  // > 0 sends "Range: bytes=<rangeStart>-".
+  size_t rangeStart = 0;
+  // Take a 206 body, and report a 416 / an ignored Range distinctly instead of
+  // collapsing them into a generic failure.
+  bool acceptPartial = false;
+  // Size of the whole resource when the server reports one, else the body length.
   size_t total = 0;
+  // Bytes handed to write() by THIS call.
   size_t downloaded = 0;
+  // Added to `downloaded` when reporting progress: the resume offset.
+  size_t progressBase = 0;
+  int status = 0;
+  bool headersRead = false;
+  // A Range was sent and the server answered 200 with the whole body.
+  bool rangeIgnored = false;
 };
 
 bool isRedirect(int status) {
   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+bool sinkExpired(const Sink& sink) {
+  if (sink.cancelFlag && *sink.cancelFlag) return true;
+  return sink.deadlineMs != 0 && static_cast<int32_t>(millis() - sink.deadlineMs) >= 0;
+}
+
+// Total size out of a Content-Range value. Handles both forms the contract can
+// emit: "bytes 655360-1874232/1874233" (206) and "bytes */1874233" (416).
+// Returns 0 for an absent header or an unknown ("*") total.
+size_t contentRangeTotal(const std::string& value) {
+  const size_t slash = value.rfind('/');
+  if (slash == std::string::npos || slash + 1 >= value.size()) return 0;
+  if (value[slash + 1] == '*') return 0;
+  return static_cast<size_t>(strtoul(value.c_str() + slash + 1, nullptr, 10));
 }
 
 #if defined(FREEINK_NET_WOLFSSL)
@@ -67,18 +100,49 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
       const String encoded = base64::encode(credentials.c_str());
       http.addHeader("Authorization", std::string("Basic ") + encoded.c_str());
     }
+    // begin() clears the request headers, so Range must be added after it. Added
+    // inside the hop loop deliberately: a redirected resume must still be ranged.
+    if (sink.rangeStart > 0) {
+      http.addHeader("Range", "bytes=" + std::to_string(sink.rangeStart) + "-");
+    }
 
     LOG_DBG("HTTP", "wolfSSL GET: %s", url.c_str());
     const int status = http.GET(
         [&http, &sink](const uint8_t* data, size_t len) {
-          if (http.getStatus() != 200) return true;
-          if (sink.total == 0 && http.hasContentLength()) sink.total = http.getContentLength();
+          const int bodyStatus = http.getStatus();
+          // 206 carries payload for a resuming caller; anything else non-200 is
+          // an error body and must not reach the sink (it would corrupt the
+          // file the caller is appending to).
+          if (bodyStatus != 200 && !(sink.acceptPartial && bodyStatus == 206)) return true;
+          // A 200 answer to a ranged request means the server ignored the Range.
+          // The sink is positioned at the resume offset, so writing the full body
+          // here yields a file that is corrupt yet plausibly sized. Stop before
+          // the first byte and let the caller restart from 0 -- draining a whole
+          // epub we cannot use would burn the window for nothing.
+          if (bodyStatus == 200 && sink.rangeStart > 0) {
+            sink.rangeIgnored = true;
+            return false;
+          }
+          if (!sink.headersRead) {
+            sink.headersRead = true;
+            // On a 206 Content-Length is the SLICE length, not the file size, so
+            // a resume at 90% would otherwise report progress starting from 0.
+            if (sink.acceptPartial) sink.total = contentRangeTotal(http.getHeader("content-range"));
+            if (sink.total == 0 && http.hasContentLength()) sink.total = http.getContentLength();
+          }
           if (!sink.write(data, len)) return false;
           sink.downloaded += len;
-          if (sink.progress && sink.total > 0) sink.progress(sink.downloaded, sink.total);
+          if (sink.progress && sink.total > 0) sink.progress(sink.progressBase + sink.downloaded, sink.total);
           return true;
         },
-        [&sink]() { return sink.cancelFlag && *sink.cancelFlag; });
+        [&sink]() { return sinkExpired(sink); });
+
+    // Captured before the aborted()/status gates below so a caller that hit its
+    // deadline mid-body still learns the status and the resource size.
+    sink.status = status;
+    if (sink.acceptPartial && sink.total == 0) {
+      sink.total = contentRangeTotal(http.getHeader("content-range"));
+    }
 
     if (http.aborted()) return HttpDownloader::ABORTED;
     if (status < 0) {
@@ -93,9 +157,19 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
       }
       continue;
     }
-    if (status != 200) {
+    if (status != 200 && !(sink.acceptPartial && status == 206)) {
+      if (sink.acceptPartial && status == 416) {
+        LOG_DBG("HTTP", "wolfSSL 416 at offset %zu (total %zu)", sink.rangeStart, sink.total);
+        return HttpDownloader::RANGE_NOT_SATISFIABLE;
+      }
       LOG_ERR("HTTP", "wolfSSL unexpected status: %d", status);
       return HttpDownloader::HTTP_ERROR;
+    }
+    // Checked before callbackAborted(): the callback is what stopped the body,
+    // and "the server does not do ranges" is not a file error.
+    if (sink.rangeIgnored) {
+      LOG_ERR("HTTP", "wolfSSL server ignored Range at offset %zu", sink.rangeStart);
+      return HttpDownloader::RANGE_IGNORED;
     }
     if (http.callbackAborted()) return HttpDownloader::FILE_ERROR;
     if (!http.responseComplete()) {
@@ -144,6 +218,10 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     const String header = "Basic " + base64::encode(credentials.c_str());
     esp_http_client_set_header(client, "Authorization", header.c_str());
   }
+  if (sink.rangeStart > 0) {
+    const std::string range = "bytes=" + std::to_string(sink.rangeStart) + "-";
+    esp_http_client_set_header(client, "Range", range.c_str());
+  }
 
   // open()/read() does not auto-follow redirects (only perform() does), so step
   // 30x responses manually. OPDS download endpoints and the GitHub release CDN
@@ -169,15 +247,31 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     status = esp_http_client_get_status_code(client);
   }
 
-  if (status != 200) {
+  // Dead code on every shipping env (all of them define FREEINK_NET_WOLFSSL and
+  // dispatch to runGetWolf), kept in step with it so the two paths cannot answer
+  // a resume differently. NOT covered by the compile gate.
+  sink.status = status;
+  if (status != 200 && !(sink.acceptPartial && status == 206)) {
+    if (sink.acceptPartial && status == 416) {
+      esp_http_client_cleanup(client);
+      return HttpDownloader::RANGE_NOT_SATISFIABLE;
+    }
     LOG_ERR("HTTP", "unexpected status: %d", status);
     esp_http_client_cleanup(client);
     return HttpDownloader::HTTP_ERROR;
   }
+  if (sink.rangeStart > 0 && status == 200) {
+    LOG_ERR("HTTP", "server ignored Range at offset %zu", sink.rangeStart);
+    esp_http_client_cleanup(client);
+    return HttpDownloader::RANGE_IGNORED;
+  }
 
   // fetch_headers returns 0 for a chunked response (no Content-Length); leave
-  // total at 0 so progress stays silent and the size check is skipped.
+  // total at 0 so progress stays silent and the size check is skipped. On a 206
+  // the length is the slice, and the range is always open-ended ("bytes=N-"),
+  // so the resource total is exactly rangeStart + slice.
   sink.total = contentLength > 0 ? static_cast<size_t>(contentLength) : 0;
+  if (status == 206 && sink.total > 0) sink.total += sink.rangeStart;
 
   auto buf = makeUniqueNoThrow<char[]>(READ_CHUNK);
   if (!buf) {
@@ -187,7 +281,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   }
 
   while (true) {
-    if (sink.cancelFlag && *sink.cancelFlag) {
+    if (sinkExpired(sink)) {
       esp_http_client_cleanup(client);
       return HttpDownloader::ABORTED;
     }
@@ -203,7 +297,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
       return HttpDownloader::FILE_ERROR;
     }
     sink.downloaded += read;
-    if (sink.progress && sink.total > 0) sink.progress(sink.downloaded, sink.total);
+    if (sink.progress && sink.total > 0) sink.progress(sink.progressBase + sink.downloaded, sink.total);
   }
 
   const bool complete = esp_http_client_is_complete_data_received(client);
@@ -251,10 +345,11 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
-                              const std::string& password) {
+                              const std::string& password, uint32_t deadlineMs) {
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
   Sink sink;
   sink.write = onData;
+  sink.deadlineMs = deadlineMs;
   return runGetSecure(url, username, password, sink) == OK;
 }
 
@@ -293,4 +388,54 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   }
   LOG_DBG("HTTP", "Downloaded %zu bytes", sink.downloaded);
   return OK;
+}
+
+HttpDownloader::RangeResult HttpDownloader::resumeToFile(const std::string& url, const std::string& destPath,
+                                                        size_t rangeStart, uint32_t deadlineMs,
+                                                        ProgressCallback progress, bool* cancelFlag,
+                                                        const std::string& username, const std::string& password) {
+  LOG_DBG("HTTP", "Resuming: %s -> %s from %zu", url.c_str(), destPath.c_str(), rangeStart);
+  RangeResult out;
+
+  // openFileForWrite() is hardcoded O_RDWR|O_CREAT|O_TRUNC, so the first write of
+  // a resumed download would discard everything already fetched. Use the raw
+  // oflag path and seek explicitly instead of relying on an append flag -- the
+  // SdFat oflag set is not vendored here, so only the flags with in-tree
+  // precedent (HalSystem.cpp, Dictionary.cpp) are used.
+  HalFile file = Storage.open(destPath.c_str(), O_WRITE | O_CREAT);
+  if (!file) {
+    LOG_ERR("HTTP", "Failed to open %s for resume", destPath.c_str());
+    out.error = FILE_ERROR;
+    return out;
+  }
+  if (rangeStart > 0 && !file.seekSet(rangeStart)) {
+    LOG_ERR("HTTP", "Failed to seek %s to %zu", destPath.c_str(), rangeStart);
+    file.close();
+    out.error = FILE_ERROR;
+    return out;
+  }
+
+  Sink sink;
+  sink.progress = std::move(progress);
+  sink.cancelFlag = cancelFlag;
+  sink.deadlineMs = deadlineMs;
+  sink.rangeStart = rangeStart;
+  sink.acceptPartial = true;
+  sink.progressBase = rangeStart;
+  sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
+
+  out.error = runGetSecure(url, username, password, sink);
+  // Close before the caller can rename or re-open the path (DESTRUCTOR_CLOSES_FILE
+  // would otherwise close only once `file` leaves scope).
+  file.close();
+  out.bytesWritten = sink.downloaded;
+  out.resourceTotal = sink.total;
+  out.status = sink.status;
+
+  // Deliberately no remove() on ANY path, including failure and a zero-byte
+  // body: for a multi-window resume the partial file is the only progress state
+  // there is, and a transport failure is expected to be retried, not restarted.
+  LOG_DBG("HTTP", "Resume result %d: +%zu bytes (status %d, total %zu)", static_cast<int>(out.error),
+          out.bytesWritten, out.status, out.resourceTotal);
+  return out;
 }
