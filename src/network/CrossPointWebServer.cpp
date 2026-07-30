@@ -1268,6 +1268,12 @@ void CrossPointWebServer::handlePostSettings() {
 
   const auto& settings = getSettingsList(&sdFontSystem.registry());
   int applied = 0;
+  // Keys whose setter refused the value. Out-of-range ENUM/VALUE entries have
+  // always been skipped silently, which is survivable for a number the browser
+  // already constrained with min/max/step -- a string input has no such fence, so
+  // a refusal that returned 200 would read as "saved" and the page would update
+  // its baseline to a value the device never took. Collected, then reported.
+  String rejected;
 
   for (const auto& s : settings) {
     if (!s.key) continue;
@@ -1309,7 +1315,11 @@ void CrossPointWebServer::handlePostSettings() {
       case SettingType::STRING: {
         const std::string val = doc[s.key].as<std::string>();
         if (s.stringSetter) {
-          s.stringSetter(val);
+          if (!s.stringSetter(val)) {
+            if (rejected.length() > 0) rejected += ", ";
+            rejected += s.key;
+            break;  // stored value untouched, and not counted as applied
+          }
         } else if (s.stringMaxLen > 0) {
           char* ptr = reinterpret_cast<char*>(&SETTINGS) + s.stringOffset;
           strncpy(ptr, val.c_str(), s.stringMaxLen - 1);
@@ -1324,6 +1334,17 @@ void CrossPointWebServer::handlePostSettings() {
   }
 
   SETTINGS.saveToFile();
+
+  if (rejected.length() > 0) {
+    // The accepted settings above are kept and saved -- a refused passphrase is no
+    // reason to drop the toggle next to it -- but the response is an error, so the
+    // page surfaces it and does NOT move its baseline for the refused key. The
+    // client re-sends it on the next save, which is harmless and correct.
+    LOG_DBG("WEB", "Applied %d setting(s), rejected: %s", applied, rejected.c_str());
+    server->send(400, "text/plain",
+                 String("Applied ") + String(applied) + " setting(s). Rejected (invalid value): " + rejected);
+    return;
+  }
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");

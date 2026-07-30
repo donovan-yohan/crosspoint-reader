@@ -75,11 +75,16 @@ constexpr size_t PSK_LEN = 10;  // 10 chars over a 32-symbol alphabet = 50 bits.
 constexpr char PSK_ALPHABET[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ#";
 static_assert(sizeof(PSK_ALPHABET) - 1 == 32, "PSK alphabet must be exactly 32 symbols for a uniform 5-bit draw");
 // WPA2 passphrase bounds. PSK_LEN sits inside them by construction; these exist to
-// judge a value read back off the card, which a user can hand-edit and a truncated
-// write can corrupt. A too-short PSK would make softAP() fail outright, so a stored
-// value that is out of bounds is treated as "not minted" rather than trusted.
-constexpr size_t PSK_MIN_LEN = 8;
-constexpr size_t PSK_MAX_LEN = 63;
+// judge a value read back off the card, which a user can hand-edit, a truncated
+// write can corrupt, and -- since the settings surfaces landed -- a user can type.
+// A too-short PSK would make softAP() fail outright, so a stored value that is out
+// of bounds is treated as "not minted" rather than trusted.
+//
+// Aliases, not a second opinion: the settings entry that lets a user set this value
+// checks the SAME two numbers, so "what the editor accepts" and "what the AP will
+// actually run with" cannot drift apart.
+constexpr size_t PSK_MIN_LEN = CrossPointState::MAILBOX_AP_PSK_MIN_LEN;
+constexpr size_t PSK_MAX_LEN = CrossPointState::MAILBOX_AP_PSK_MAX_LEN;
 static_assert(PSK_LEN >= PSK_MIN_LEN && PSK_LEN <= PSK_MAX_LEN, "generated PSK must be a legal WPA2 passphrase");
 
 std::string generatePsk() {
@@ -95,11 +100,12 @@ std::string generatePsk() {
 // freshly minted one, persisted before it is ever shown so the value on the panel
 // and the value on the card can never disagree.
 //
-// There is no in-UI "regenerate" yet, deliberately: the join panel's spare button
-// slots are cheap but the label is not -- a new user-visible string is a key, a
-// generator run and 31 translation files -- and the reset path (clear mailboxApPsk
-// in state.json) covers the only case anyone has actually needed. Worth adding the
-// moment a second string on this screen has to be translated anyway.
+// The passphrase is also USER-SETTABLE, from Settings > System on the device and
+// from the web settings UI (key "mailboxApPsk"). Neither editor mints: they write a
+// value or clear it, and clearing it lands exactly here -- an empty stored value is
+// out of bounds, so the next AP session mints a fresh one. That is the whole
+// "regenerate" story, and it is why the join panel itself still has no button: the
+// mint belongs to the session that needs the radio up, not to a settings screen.
 //
 // The save is the only SD write this mode adds, and it happens on exactly one
 // session in the life of the device. If it fails, the passphrase is still used for

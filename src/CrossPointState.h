@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <PersistableStore.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -12,6 +13,16 @@ class CrossPointState : public PersistableStore<CrossPointState> {
 
  public:
   static constexpr uint8_t SLEEP_RECENT_COUNT = 16;
+
+  // WPA2 passphrase bounds for mailboxApPsk, and the single source of truth for
+  // every surface that touches it: the mint and the softAP bring-up in
+  // MailboxSyncActivity, the web settings API, and the on-device Settings entry.
+  // A value outside these bounds cannot raise a softAP at all, so it is refused
+  // on the way IN (both editors) and treated as "not minted" on the way OUT
+  // (devicePsk re-mints), which keeps a hand-edited state.json from producing an
+  // AP that silently refuses to start.
+  static constexpr size_t MAILBOX_AP_PSK_MIN_LEN = 8;
+  static constexpr size_t MAILBOX_AP_PSK_MAX_LEN = 63;
 
   std::string openEpubPath;
   uint16_t recentSleepImages[SLEEP_RECENT_COUNT] = {};  // circular buffer of recent wallpaper indices
@@ -48,8 +59,14 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   // at boot: a device whose owner only ever syncs over a saved network never
   // generates one, and the mint needs the radio powered for the hardware RNG.
   //
-  // Empty here means "not minted yet", which is also the recovery path: clear this
-  // key in state.json and the next AP session mints a new one.
+  // Empty here means "not minted yet", which is also the reset path: clear this
+  // value and the next AP session mints a new one.
+  //
+  // USER-EDITABLE. Both the web settings UI and the on-device System settings
+  // expose it (key "mailboxApPsk"), so this string is no longer only ever written
+  // by the mint: a user may set their own passphrase, and clearing it to "" is the
+  // supported "regenerate on the next session" gesture. Anything written here goes
+  // through the MAILBOX_AP_PSK_* bounds above -- MIN_LEN..MAX_LEN, or empty.
   std::string mailboxApPsk;
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;

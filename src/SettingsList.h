@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
 #include "KOReaderCredentialStore.h"
 #include "ReaderFontSizes.h"
 #include "activities/settings/SettingsActivity.h"
@@ -315,6 +316,41 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
         SettingInfo::Toggle(StrId::STR_MESSAGE_SYNC, &CrossPointSettings::messageSyncEnabled, "messageSyncEnabled",
                             StrId::STR_CAT_SYSTEM),
+        // "Sync with app" AP passphrase (contract appendix A3). It lives in APP_STATE
+        // rather than CrossPointSettings -- the AP bring-up mints it, and it has to
+        // outlive a settings reset -- so it is a DynamicString proxying that store
+        // instead of a value migrated into a char[] here.
+        //
+        // Categorized, so unlike messageSyncUrl it is on the DEVICE screen too: this
+        // is the one string a user reads off the panel and types into a phone, so
+        // "let me pick something I can retype" and "let me see what it is" both want
+        // to be answerable without a laptop.
+        SettingInfo::DynamicString(
+            StrId::STR_MAILBOX_AP_PASSPHRASE, [] { return APP_STATE.mailboxApPsk; },
+            [](const std::string& v) {
+              // Empty is the documented reset, not a rejection: devicePsk() treats an
+              // out-of-bounds stored value as "not minted", so clearing this field IS
+              // the regenerate gesture -- the next AP session draws a fresh one with
+              // the radio up, which is the only place the hardware RNG is honest.
+              if (!v.empty() && (v.size() < CrossPointState::MAILBOX_AP_PSK_MIN_LEN ||
+                                 v.size() > CrossPointState::MAILBOX_AP_PSK_MAX_LEN)) {
+                return false;  // a PSK outside WPA2's bounds cannot raise the AP at all
+              }
+              if (v == APP_STATE.mailboxApPsk) return true;
+              const std::string previous = APP_STATE.mailboxApPsk;
+              APP_STATE.mailboxApPsk = v;
+              if (!APP_STATE.saveToFile()) {
+                // Roll back rather than report a save that did not happen. The
+                // alternative is an AP running this session on a passphrase the card
+                // has never seen, silently reverting at the next boot -- exactly the
+                // re-pair trap this field was added to close.
+                APP_STATE.mailboxApPsk = previous;
+                return false;
+              }
+              return true;
+            },
+            "mailboxApPsk", StrId::STR_CAT_SYSTEM, CrossPointState::MAILBOX_AP_PSK_MAX_LEN)
+            .withInvalidHint(StrId::STR_MAILBOX_AP_PASSPHRASE_RULE),
 
         // OPDS download folder: persisted + web-exposed, but category-less so it
         // is hidden from the on-device Settings screen (edited via OPDS UI).
@@ -331,11 +367,15 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                           "opdsFilenameFormat"),
 
         // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
+        // These setters have nothing to validate -- any string is a legal username,
+        // password or URL as far as this store is concerned -- so they accept
+        // unconditionally. Returning true is "applied", not "ignored".
         SettingInfo::DynamicString(
             StrId::STR_KOREADER_USERNAME, [] { return KOREADER_STORE.getUsername(); },
             [](const std::string& v) {
               KOREADER_STORE.setCredentials(v, KOREADER_STORE.getPassword());
               KOREADER_STORE.saveToFile();
+              return true;
             },
             "koUsername", StrId::STR_KOREADER_SYNC),
         SettingInfo::DynamicString(
@@ -343,6 +383,7 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
             [](const std::string& v) {
               KOREADER_STORE.setCredentials(KOREADER_STORE.getUsername(), v);
               KOREADER_STORE.saveToFile();
+              return true;
             },
             "koPassword", StrId::STR_KOREADER_SYNC),
         SettingInfo::DynamicString(
@@ -350,6 +391,7 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
             [](const std::string& v) {
               KOREADER_STORE.setServerUrl(v);
               KOREADER_STORE.saveToFile();
+              return true;
             },
             "koServerUrl", StrId::STR_KOREADER_SYNC),
         SettingInfo::DynamicEnum(
