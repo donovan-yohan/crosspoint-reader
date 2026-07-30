@@ -14,10 +14,15 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   static constexpr uint8_t SLEEP_RECENT_COUNT = 16;
 
   std::string openEpubPath;
-  std::string messageLastShownId;  // M2 #1: id of the last love-note actually shown (dedup)
   uint16_t recentSleepImages[SLEEP_RECENT_COUNT] = {};  // circular buffer of recent wallpaper indices
   uint8_t recentSleepPos = 0;                           // next write slot
   uint8_t recentSleepFill = 0;                          // valid entries (0..SLEEP_RECENT_COUNT)
+  // M2 #2: minute-of-day (0..1439) of the last Path B note check, -1 when never
+  // stamped or no RTC. Best-effort throttle only; see MessageSync.cpp. The M2 #1
+  // messageLastShownId field is gone: under the lock-screen model a note is not
+  // consumed by being seen, so nothing reads a "last shown" id (old keys in
+  // state.json are simply ignored by fromJson).
+  int16_t messageCheckMinuteOfDay = -1;
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;
   bool showBootScreen = true;
