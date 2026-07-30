@@ -13,6 +13,7 @@
 #include "SilentRestart.h"
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
+#include "activities/network/MailboxSyncActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/QrUtils.h"
@@ -115,6 +116,10 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
     modeName = "Connect to Calibre";
   } else if (mode == NetworkMode::CREATE_HOTSPOT) {
     modeName = "Create Hotspot";
+  } else if (mode == NetworkMode::MAILBOX_SYNC) {
+    modeName = "Mailbox Sync";
+  } else if (mode == NetworkMode::SYNC_WITH_APP) {
+    modeName = "Sync with App";
   }
   LOG_DBG("WEBACT", "Network mode selected: %s", modeName);
 
@@ -124,6 +129,35 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
   if (mode == NetworkMode::CONNECT_CALIBRE) {
     startActivityForResult(
         std::make_unique<CalibreConnectActivity>(renderer, mappedInput), [this](const ActivityResult& result) {
+          state = WebServerActivityState::MODE_SELECTION;
+
+          startActivityForResult(std::make_unique<NetworkModeSelectionActivity>(renderer, mappedInput),
+                                 [this](const ActivityResult& result) {
+                                   if (result.isCancelled) {
+                                     onGoHome();
+                                   } else {
+                                     onNetworkModeSelected(std::get<NetworkModeResult>(result.data).mode);
+                                   }
+                                 });
+        });
+    return;
+  }
+
+  // Both mailbox-sync modes go into ONE dedicated activity, handled the way
+  // CONNECT_CALIBRE is -- startActivityForResult rather than inside this activity,
+  // which exists to run a web server neither mode wants (appendix A4: "not inside
+  // CrossPointWebServerActivity itself"). This activity's own AP/STA state stays
+  // untouched: the sync activity owns the radio for its whole life and hands it
+  // back off, and it normally never returns here at all because it exits through
+  // silentRestart() to Home.
+  if (mode == NetworkMode::MAILBOX_SYNC || mode == NetworkMode::SYNC_WITH_APP) {
+    const auto transport =
+        (mode == NetworkMode::MAILBOX_SYNC) ? MailboxSync::Transport::SavedNetwork : MailboxSync::Transport::PhoneAp;
+    startActivityForResult(
+        std::make_unique<MailboxSyncActivity>(renderer, mappedInput, transport), [this](const ActivityResult&) {
+          // Only reached when the sync activity declined to bring a link up at all
+          // (no mailbox URL configured, no saved network in range), so there is no
+          // heap to defragment and no reboot happened. Back to the menu.
           state = WebServerActivityState::MODE_SELECTION;
 
           startActivityForResult(std::make_unique<NetworkModeSelectionActivity>(renderer, mappedInput),
