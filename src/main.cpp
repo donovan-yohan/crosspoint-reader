@@ -278,11 +278,25 @@ void enterDeepSleep(bool fromTimeout = false) {
     // a property of the id rather than of two call sites agreeing. The id is
     // recorded after the refresh, so this note reverts to wallpaper next sleep.
     if (stagedNewNote && !isQuickResumeSleep && MessageSync::noteAwaitingDisplay()) {
-      RenderLock lock;
-      if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
-        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-        MessageSync::markStagedNoteDisplayed();
+      bool painted = false;
+      {
+        RenderLock lock;
+        if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
+          renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+          painted = true;
+        }
       }
+      // The turn is consumed AFTER the render lock is released, never inside it.
+      // markStagedNoteDisplayed() writes the id sidecar to SD and then calls
+      // APP_STATE.saveToFile(), which takes PersistableStore's storeMutex --
+      // and PersistableStore.h says in as many words that storeMutex must not be
+      // acquired on the render path (the storeMutex/storageMutex ordering
+      // hazard). SleepActivity's paint site already calls this outside any
+      // RenderLock, so the two sites now agree instead of disagreeing.
+      //
+      // Display-once is untouched: the id is still recorded only when the panel
+      // physically took the frame, and still before deep sleep begins.
+      if (painted) MessageSync::markStagedNoteDisplayed();
     }
 
     // Whatever is left of the window goes to books: at most one book, resumed

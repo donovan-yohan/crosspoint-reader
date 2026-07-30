@@ -218,7 +218,9 @@ void wakeFinish(const char* why) {
   if (wake.step == WakeStep::Idle) return;
   MessageSync::radioOff();
   wake = WakeCheck{};  // back to Idle, and releases the held strings
-  LOG_DBG("MSYNC", "Wake check finished (%s)", why);
+  // Paired with the "Wake check armed" line: armed-then-finished(why) is the
+  // whole Path B story in two lines, and INF keeps it in release builds.
+  LOG_INF("MSYNC", "Wake check finished (%s)", why);
 }
 
 // One polled connect step. 1 = associated, 0 = still trying, -1 = give up.
@@ -276,7 +278,11 @@ bool MessageSync::connectSavedNetwork(const uint32_t budgetMs) {
   WIFI_STORE.loadFromFile();
   const auto& creds = WIFI_STORE.getCredentials();
   if (creds.empty()) {
-    LOG_DBG("MSYNC", "No saved WiFi credentials");
+    // INF, not DBG: this and the budget-exhausted line below are the two answers
+    // to "why did the unattended sync do nothing", and gh_release/gh_release_rc
+    // build at LOG_LEVEL=1 -- DBG is compiled out of exactly the builds most
+    // likely to be in a user's hand when it fails.
+    LOG_INF("MSYNC", "No saved WiFi credentials");
     return false;
   }
 
@@ -312,7 +318,7 @@ bool MessageSync::connectSavedNetwork(const uint32_t budgetMs) {
     }
     WiFi.disconnect(true, false);
   }
-  LOG_DBG("MSYNC", "No saved network reachable within budget");
+  LOG_INF("MSYNC", "No saved network reachable within budget");
   return false;
 }
 
@@ -344,12 +350,50 @@ MessageSync::NoteResult MessageSync::syncOnLink(const std::string& base, size_t 
   return promoteIncoming(latestId, frameBufferSize) ? NoteResult::Staged : NoteResult::Failed;
 }
 
+namespace {
+const char* noteResultName(const MessageSync::NoteResult r) {
+  switch (r) {
+    case MessageSync::NoteResult::Failed:
+      return "fetch failed";
+    case MessageSync::NoteResult::NoNote:
+      return "mailbox empty";
+    case MessageSync::NoteResult::UpToDate:
+      return "already staged";
+    case MessageSync::NoteResult::Staged:
+      return "staged a new note";
+  }
+  return "unknown";
+}
+}  // namespace
+
+// Every exit below names its reason at INF. This path is unattended and has NO
+// UI whatsoever: when it declines to run, the device is byte-for-byte
+// indistinguishable from a healthy one -- nothing paints, nothing errors, and
+// (the part that actually costs the time) NO request reaches the mailbox, so the
+// server logs cannot tell "switched off" from "never woke" from "no WiFi". These
+// gates used to be silent returns; one flipped bool then reads as a dead radio.
+//
+// Three reasons this is LOG_INF and not LOG_DBG:
+//   - gh_release / gh_release_rc build at LOG_LEVEL=1, so DBG is compiled OUT of
+//     precisely the builds a user is holding when this fails.
+//   - the log ring is RTC_NOINIT (Logging.cpp), so a line written here SURVIVES
+//     the deep sleep that follows and is still readable at the next wake, both
+//     over serial and through getLastLogs() in the web UI. That is the only
+//     forensic trail this path can leave.
+//   - it is at most one line per sleep.
 bool MessageSync::syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, const LinkUpHook& whileLinkUp) {
-  if (!SETTINGS.messageSyncEnabled) return false;
+  if (!SETTINGS.messageSyncEnabled) {
+    LOG_INF("MSYNC", "Sleep sync OFF: 'Message sync' is disabled in Settings > System");
+    return false;
+  }
   const std::string base = configuredBase();
-  if (base.empty()) return false;
+  if (base.empty()) {
+    LOG_INF("MSYNC", "Sleep sync OFF: no mailbox URL configured");
+    return false;
+  }
 
   if (!connectSavedNetwork()) {
+    LOG_INF("MSYNC", "Sleep sync skipped: no saved WiFi network joined");
     radioOff();
     return false;
   }
@@ -360,7 +404,12 @@ bool MessageSync::syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, con
   // connect's own <= 6 s budget is not double-charged -- and never past the
   // caller's deadline.
   const uint32_t noteDeadline = deadlineWithin(deadline, NOTE_PASS_BUDGET_MS);
-  const bool staged = syncOnLink(base, frameBufferSize, noteDeadline) == NoteResult::Staged;
+  const NoteResult note = syncOnLink(base, frameBufferSize, noteDeadline);
+  const bool staged = note == NoteResult::Staged;
+  // The positive breadcrumb, and the one that matters most: it proves the window
+  // ran end to end -- radio up, mailbox answered -- which is what separates "the
+  // reader never asked" from "the reader asked and got nothing".
+  LOG_INF("MSYNC", "Sleep sync note pass: %s", noteResultName(note));
 
   // Everything else that needs this window happens here, on the link the connect
   // above already paid for. Bounded by the hook itself -- see BookSync::syncOnLink.
@@ -370,15 +419,24 @@ bool MessageSync::syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, con
   return staged;
 }
 
+// Same three gates as syncBeforeSleep, same silence problem, same treatment:
+// this is the OTHER unattended entry point, and when both are off the device
+// stops talking to the mailbox entirely with nothing anywhere to say why.
 void MessageSync::beginWakeCheck(size_t frameBufferSize) {
   if (wake.step != WakeStep::Idle) return;
-  if (!SETTINGS.messageSyncEnabled) return;
+  if (!SETTINGS.messageSyncEnabled) {
+    LOG_INF("MSYNC", "Wake check OFF: 'Message sync' is disabled in Settings > System");
+    return;
+  }
   std::string base = configuredBase();
-  if (base.empty()) return;
+  if (base.empty()) {
+    LOG_INF("MSYNC", "Wake check OFF: no mailbox URL configured");
+    return;
+  }
 
   WIFI_STORE.loadFromFile();
   if (WIFI_STORE.getCredentials().empty()) {
-    LOG_DBG("MSYNC", "No saved WiFi credentials");
+    LOG_INF("MSYNC", "Wake check skipped: no saved WiFi credentials");
     return;
   }
 
@@ -390,7 +448,7 @@ void MessageSync::beginWakeCheck(size_t frameBufferSize) {
   wake.phaseDeadline = millis() + WAKE_CONNECT_BUDGET_MS;
   wake.settleUntil = millis() + 100;
   wifiBeginSta();
-  LOG_DBG("MSYNC", "Wake check armed");
+  LOG_INF("MSYNC", "Wake check armed");
 }
 
 void MessageSync::stepWakeCheck() {

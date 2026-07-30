@@ -324,6 +324,13 @@ void SettingsActivity::toggleCurrentSetting() {
     // Toggle the boolean value using the member pointer
     const bool currentValue = SETTINGS.*(setting.valuePtr);
     SETTINGS.*(setting.valuePtr) = !currentValue;
+    // Audit line. A toggle is a one-press, unconfirmed, persisted state change,
+    // and some of these rows govern features with no other tell -- flipping
+    // messageSyncEnabled takes unattended mailbox sync offline permanently and
+    // changes nothing a user can see. INF so it survives into release builds and
+    // into the RTC log ring, which is what makes "when did this get switched
+    // off" answerable at all after the fact.
+    LOG_INF("SETTINGS", "Toggle %s -> %s", setting.key ? setting.key : "(unkeyed)", currentValue ? "off" : "on");
   } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
     const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
     if (setting.enumValues.size() > 2) {

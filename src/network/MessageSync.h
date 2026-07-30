@@ -145,8 +145,11 @@ std::string configuredBase();
 // Arm one bounded check. Call from setup() ONLY on the branch that lands at the
 // launcher AND has no book one keypress away: WiFi and EPUB rendering must never
 // be resident at once, and WIFI_OFF does not defragment the heap a TLS session
-// just fragmented. Silently no-ops when disabled, unconfigured, or without saved
-// credentials. There is no wall-clock throttle -- the throttle is structural, at
+// just fragmented. No-ops when disabled, unconfigured, or without saved
+// credentials -- but NOT silently: each of those three refusals names itself at
+// LOG_INF, because an unattended path that declines without a trace is
+// indistinguishable from a dead radio, which is exactly how it was diagnosed
+// last time. There is no wall-clock throttle -- the throttle is structural, at
 // most one check per wake, enforced by the single call site.
 void beginWakeCheck(size_t frameBufferSize);
 

@@ -304,18 +304,6 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "backShortToFileBrowser", StrId::STR_CAT_CONTROLS),
 
         // --- System ---
-        SettingInfo::Value(
-            StrId::STR_TIME_TO_SLEEP, &CrossPointSettings::sleepTimeoutMinutes,
-            {CrossPointSettings::MIN_SLEEP_TIMEOUT_MINUTES, CrossPointSettings::MAX_SLEEP_TIMEOUT_MINUTES, 1},
-            "sleepTimeoutMinutes", StrId::STR_CAT_SYSTEM),
-        SettingInfo::Toggle(StrId::STR_SHOW_HIDDEN_FILES, &CrossPointSettings::showHiddenFiles, "showHiddenFiles",
-                            StrId::STR_CAT_SYSTEM),
-        SettingInfo::Toggle(StrId::STR_REMOVE_READ_FROM_RECENTS, &CrossPointSettings::removeReadBooksFromRecents,
-                            "removeReadBooksFromRecents", StrId::STR_CAT_SYSTEM),
-        SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
-                            "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
-        SettingInfo::Toggle(StrId::STR_MESSAGE_SYNC, &CrossPointSettings::messageSyncEnabled, "messageSyncEnabled",
-                            StrId::STR_CAT_SYSTEM),
         // "Sync with app" AP passphrase (contract appendix A3). It lives in APP_STATE
         // rather than CrossPointSettings -- the AP bring-up mints it, and it has to
         // outlive a settings reset -- so it is a DynamicString proxying that store
@@ -325,6 +313,17 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
         // is the one string a user reads off the panel and types into a phone, so
         // "let me pick something I can retype" and "let me see what it is" both want
         // to be answerable without a laptop.
+        //
+        // FIRST row of System, deliberately, and NOT adjacent to the Message-sync
+        // toggle. rebuildSettingsLists() preserves declaration order, so whatever is
+        // declared beside this row is what an off-by-one press lands on -- and this
+        // is the row a user opens Settings to find after updating. Beside the
+        // Message-sync toggle, that press silently takes BOTH unattended sync paths
+        // (sleep-entry and wake check) offline: no confirmation, no warning, no
+        // visible symptom, and the reader simply never contacts the mailbox again.
+        // Here its only neighbour is "Time to sleep", which opens a picker the user
+        // can back out of. Every pre-existing System row keeps the order it had
+        // before this row was introduced.
         SettingInfo::DynamicString(
             StrId::STR_MAILBOX_AP_PASSPHRASE, [] { return APP_STATE.mailboxApPsk; },
             [](const std::string& v) {
@@ -351,6 +350,18 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
             },
             "mailboxApPsk", StrId::STR_CAT_SYSTEM, CrossPointState::MAILBOX_AP_PSK_MAX_LEN)
             .withInvalidHint(StrId::STR_MAILBOX_AP_PASSPHRASE_RULE),
+        SettingInfo::Value(
+            StrId::STR_TIME_TO_SLEEP, &CrossPointSettings::sleepTimeoutMinutes,
+            {CrossPointSettings::MIN_SLEEP_TIMEOUT_MINUTES, CrossPointSettings::MAX_SLEEP_TIMEOUT_MINUTES, 1},
+            "sleepTimeoutMinutes", StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_SHOW_HIDDEN_FILES, &CrossPointSettings::showHiddenFiles, "showHiddenFiles",
+                            StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_REMOVE_READ_FROM_RECENTS, &CrossPointSettings::removeReadBooksFromRecents,
+                            "removeReadBooksFromRecents", StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
+                            "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_MESSAGE_SYNC, &CrossPointSettings::messageSyncEnabled, "messageSyncEnabled",
+                            StrId::STR_CAT_SYSTEM),
 
         // OPDS download folder: persisted + web-exposed, but category-less so it
         // is hidden from the on-device Settings screen (edited via OPDS UI).

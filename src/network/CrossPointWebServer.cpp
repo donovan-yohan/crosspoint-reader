@@ -1283,7 +1283,18 @@ void CrossPointWebServer::handlePostSettings() {
       case SettingType::TOGGLE: {
         const int val = doc[s.key].as<int>() ? 1 : 0;
         if (s.valuePtr) {
+          const int prev = SETTINGS.*(s.valuePtr) ? 1 : 0;
           SETTINGS.*(s.valuePtr) = val;
+          // Audit line, INF, and only on an actual change. This handler applies
+          // every key PRESENT in the body, so a client that round-trips the whole
+          // settings document (GET, edit one field, POST it back) re-asserts every
+          // toggle it is holding -- including ones it never meant to touch, and
+          // including messageSyncEnabled, which takes both unattended sync paths
+          // offline with no visible symptom on the device. If that ever happens
+          // again, this line names the caller's effect at the moment it lands.
+          if (prev != val) {
+            LOG_INF("WEB", "Setting %s changed via API: %s -> %s", s.key, prev ? "on" : "off", val ? "on" : "off");
+          }
         }
         applied++;
         break;
