@@ -99,13 +99,35 @@ bool validBookFilename(const std::string& name) {
   return FsHelpers::hasEpubExtension(name);
 }
 
-size_t existingSize(const std::string& path) {
+// Size of the staging file, or 0 when there is nothing there. `ok` reports whether
+// the answer is trustworthy: a file that exists but cannot be opened (a flaky
+// card) reads as 0 bytes, and a caller that treats that as "no partial" would
+// resume from 0 over a file whose tail is still on disk. resumeToFile() adds
+// O_TRUNC at offset 0 so that is no longer corrupting, but the window is still
+// wasted, so the caller bails instead.
+size_t existingSize(const std::string& path, bool& ok) {
+  ok = true;
   if (!Storage.exists(path.c_str())) return 0;
   HalFile file;
-  if (!Storage.openFileForRead("BSYNC", path.c_str(), file)) return 0;
+  if (!Storage.openFileForRead("BSYNC", path.c_str(), file)) {
+    ok = false;
+    return 0;
+  }
   const size_t size = file.size();
   file.close();
   return size;
+}
+
+// Drop the staging file, and say so if it is still there. Every caller that
+// discards a partial then goes on to assume `have == 0`; a remove() that silently
+// failed would leave the next resume seeking into stale bytes, and the size gate
+// (the only integrity gate the contract affords -- there is no hash) cannot tell
+// the difference once the length lines up.
+bool discardPartial(const std::string& path) {
+  if (Storage.remove(path.c_str())) return true;
+  if (!Storage.exists(path.c_str())) return true;  // already gone
+  LOG_ERR("BSYNC", "cannot remove partial %s, deferring", path.c_str());
+  return false;
 }
 
 // Whole state file, bounded. Newest entry first, so a truncating read keeps the
@@ -346,8 +368,9 @@ bool promote(const ManifestEntry& entry, const std::string& part, const std::str
 
 }  // namespace
 
-// REMOVAL AUDIT -- every Storage::remove() reachable from this file targets the
-// staging file /books/.incoming/{id} and nothing else. The manifest is
+// REMOVAL AUDIT -- every Storage::remove() reachable from this file goes through
+// discardPartial() and targets the staging file /books/.incoming/{id} and nothing
+// else, and a remove that failed is reported rather than assumed. The manifest is
 // authoritative about what EXISTS on the server, never about what the reader
 // keeps: a book that has been evicted server-side, or that the manifest never
 // named, stays exactly where it is. /books is user space and the reader is the
@@ -371,13 +394,15 @@ bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline) {
   }
 
   const std::string part = std::string(INCOMING_DIR) + "/" + entry.id;
-  size_t have = existingSize(part);
+  bool sizeKnown = false;
+  size_t have = existingSize(part, sizeKnown);
+  if (!sizeKnown) return false;  // cannot read the partial: nothing safe to do this window
   if (have > entry.bytes) {
     // Longer than the manifest says: the blob was replaced under the same id
     // (same-size replacement is undetectable -- there is no ETag). Unusable.
     LOG_ERR("BSYNC", "partial %s is %u B > manifest %u, restarting", entry.id.c_str(), static_cast<unsigned>(have),
             static_cast<unsigned>(entry.bytes));
-    Storage.remove(part.c_str());
+    if (!discardPartial(part)) return false;
     have = 0;
   }
 
@@ -389,46 +414,78 @@ bool BookSync::syncOnLink(const std::string& base, const uint32_t deadline) {
       return false;
     }
 
-    LOG_INF("BSYNC", "Fetching %s from %u/%u B", entry.id.c_str(), static_cast<unsigned>(have),
-            static_cast<unsigned>(entry.bytes));
-    const HttpDownloader::RangeResult result =
-        HttpDownloader::resumeToFile(base + SUFFIX_BOOK + entry.id, part, have, deadline);
+    // At most two attempts, and the second one ONLY for an ignored Range: a
+    // server behind a range-stripping proxy answers 200 with the whole body, which
+    // delivers no bytes at all at a resume offset. Discarding the partial and
+    // re-sending the same Range next window spends that window on nothing at all --
+    // window N keeps ~600 KB, window N+1 throws it away, window N+2 is window N
+    // again. Contract section 3 step 6 says the opposite: "take the whole body or
+    // fall back to a non-resuming download". Attempt 2 always runs with have == 0,
+    // which sends no Range header at all, so it cannot come back RANGE_IGNORED and
+    // the loop terminates.
+    //
+    // What this does and does not buy, stated plainly: every window now spends its
+    // budget on bytes, and any book that fits inside one window completes. A book
+    // BIGGER than one window still cannot be delivered by a server that strips
+    // Range -- without resume there is no mechanism that could, and none of the
+    // options is better: a persisted "does not range" flag cannot resume either,
+    // and writing a `skip` line would permanently deny the user a book that would
+    // arrive fine on the next network. So it keeps retrying, from 0, one window at a
+    // time. Only reachable behind such a proxy: single-range support is mandatory
+    // for the contract server and is byte-verified there.
+    bool transferred = false;
+    for (int attempt = 0; attempt < 2 && !transferred; ++attempt) {
+      if (attempt > 0 && remainingMs(deadline) < static_cast<int32_t>(MIN_USEFUL_MS)) {
+        LOG_DBG("BSYNC", "no useful budget left to restart %s", entry.id.c_str());
+        return false;
+      }
+      LOG_INF("BSYNC", "Fetching %s from %u/%u B", entry.id.c_str(), static_cast<unsigned>(have),
+              static_cast<unsigned>(entry.bytes));
+      const HttpDownloader::RangeResult result =
+          HttpDownloader::resumeToFile(base + SUFFIX_BOOK + entry.id, part, have, deadline);
 
-    // The ONE signal available that the bytes changed underneath a resume: the
-    // total the server reports versus the size the manifest advertised.
-    if (result.resourceTotal != 0 && result.resourceTotal != entry.bytes) {
-      LOG_ERR("BSYNC", "%s is %u B on the server, manifest says %u: discarding partial", entry.id.c_str(),
-              static_cast<unsigned>(result.resourceTotal), static_cast<unsigned>(entry.bytes));
-      Storage.remove(part.c_str());
-      return false;
-    }
+      // The ONE signal available that the bytes changed underneath a resume: the
+      // total the server reports versus the size the manifest advertised.
+      if (result.resourceTotal != 0 && result.resourceTotal != entry.bytes) {
+        LOG_ERR("BSYNC", "%s is %u B on the server, manifest says %u: discarding partial", entry.id.c_str(),
+                static_cast<unsigned>(result.resourceTotal), static_cast<unsigned>(entry.bytes));
+        discardPartial(part);
+        return false;
+      }
 
-    switch (result.error) {
-      case HttpDownloader::OK:
-      case HttpDownloader::ABORTED:  // deadline reached mid-body: the bytes so far are good
-        break;
-      case HttpDownloader::RANGE_NOT_SATISFIABLE:
-        // The offset is at or past the end and the totals agree, so the partial
-        // cannot be extended and cannot be trusted. Restart cleanly next window
-        // rather than retrying the same range for ever.
-        LOG_ERR("BSYNC", "416 for %s at %u B, discarding partial", entry.id.c_str(), static_cast<unsigned>(have));
-        Storage.remove(part.c_str());
-        return false;
-      case HttpDownloader::RANGE_IGNORED:
-        // Not one byte was written, so the partial is intact -- but this server
-        // will not resume it. Drop it and take the whole body from 0 next window.
-        LOG_ERR("BSYNC", "server will not range %s, discarding partial", entry.id.c_str());
-        Storage.remove(part.c_str());
-        return false;
-      default:
-        // Transport or SD failure. KEEP the partial: it is the resume state, and
-        // this is the single biggest departure from the note path, where deleting
-        // on failure is right because a frame is one-shot.
-        LOG_ERR("BSYNC", "%s transfer failed (%d) after +%u B", entry.id.c_str(), static_cast<int>(result.error),
-                static_cast<unsigned>(result.bytesWritten));
-        return false;
+      switch (result.error) {
+        case HttpDownloader::OK:
+        case HttpDownloader::ABORTED:  // deadline reached mid-body: the bytes so far are good
+          transferred = true;
+          break;
+        case HttpDownloader::RANGE_NOT_SATISFIABLE:
+          // The offset is at or past the end and the totals agree, so the partial
+          // cannot be extended and cannot be trusted. Restart cleanly next window
+          // rather than retrying the same range for ever.
+          LOG_ERR("BSYNC", "416 for %s at %u B, discarding partial", entry.id.c_str(), static_cast<unsigned>(have));
+          discardPartial(part);
+          return false;
+        case HttpDownloader::RANGE_IGNORED:
+          // Not one byte was written, so the partial is intact -- but this server
+          // will not resume it. Restart from 0 inside THIS window (resumeToFile
+          // truncates at offset 0, so the stale tail cannot survive) rather than
+          // deferring a restart that would be answered with the same Range.
+          LOG_ERR("BSYNC", "server ignored Range for %s, restarting from 0", entry.id.c_str());
+          if (!discardPartial(part)) return false;
+          have = 0;
+          continue;
+        default:
+          // Transport or SD failure. KEEP the partial: it is the resume state, and
+          // this is the single biggest departure from the note path, where deleting
+          // on failure is right because a frame is one-shot.
+          LOG_ERR("BSYNC", "%s transfer failed (%d) after +%u B", entry.id.c_str(), static_cast<int>(result.error),
+                  static_cast<unsigned>(result.bytesWritten));
+          return false;
+      }
     }
-    have = existingSize(part);
+    if (!transferred) return false;
+    have = existingSize(part, sizeKnown);
+    if (!sizeKnown) return false;
   }
 
   if (have != entry.bytes) {

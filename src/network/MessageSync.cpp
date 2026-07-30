@@ -1,7 +1,6 @@
 #include "MessageSync.h"
 
 #include <Arduino.h>
-#include <HalClock.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <WiFi.h>
@@ -33,6 +32,22 @@ constexpr char SUFFIX_FRAME[] = "/current.frame";
 constexpr uint32_t CONNECT_DEADLINE_MS = 6000;
 constexpr uint32_t STATUS_POLL_MS = 100;
 constexpr size_t MAX_ID_LEN = 128;
+
+// Wall-clock budget for the note half of a sleep-entry sync, measured from the
+// moment the association comes up: one tiny latest.txt GET plus, at most, one
+// frame (52272 B on the X3) at the contract's 30 KB/s pessimistic floor = ~1.8 s,
+// so 10 s is a handshake plus ~4x slack. Capped rather than "whatever is left of
+// the sleep window" so a mailbox that associates but does not answer cannot spend
+// the books budget too -- and clamped to the caller's deadline, which always wins.
+constexpr uint32_t NOTE_PHASE_BUDGET_MS = 10000;
+
+// Absolute deadline `budget` ms from now, never past `cap` (an absolute deadline,
+// 0 = uncapped).
+uint32_t deadlineWithin(uint32_t cap, uint32_t budget) {
+  const uint32_t want = millis() + budget;
+  if (cap == 0) return want;
+  return static_cast<int32_t>(want - cap) > 0 ? cap : want;
+}
 
 std::string trimId(std::string s) {
   while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
@@ -126,9 +141,12 @@ bool connectHeadless() {
 enum class Probe : uint8_t { Failed, Empty, UpToDate, NewNote };
 
 // Cheap dedup probe: one tiny GET of the mailbox's latest id. Requires WiFi.
-Probe probeLatest(const std::string& base, std::string& latestIdOut) {
+// `deadline` is an absolute millis() bound on the call (0 = none): this is a
+// BLOCKING call on whichever task runs it, so the deadline is the only thing that
+// keeps a mailbox that associates-but-does-not-answer from holding that task.
+Probe probeLatest(const std::string& base, std::string& latestIdOut, uint32_t deadline) {
   std::string latestId;
-  if (!HttpDownloader::fetchUrl(base + SUFFIX_ID, latestId)) {
+  if (!HttpDownloader::fetchUrl(base + SUFFIX_ID, latestId, "", "", deadline)) {
     LOG_DBG("MSYNC", "latest-id fetch failed");
     return Probe::Failed;
   }
@@ -149,12 +167,15 @@ Probe probeLatest(const std::string& base, std::string& latestIdOut) {
   return Probe::NewNote;
 }
 
-// Download the frame to INCOMING_FRAME. Requires WiFi.
-HttpDownloader::DownloadError downloadIncoming(const std::string& base) {
+// Download the frame to INCOMING_FRAME. Requires WiFi. `deadline` is an absolute
+// millis() bound (0 = none) -- see probeLatest: blocking call, and the file is
+// removed by the caller on any non-OK result, so a deadline hit mid-body simply
+// re-fetches next window rather than leaving a torn frame staged.
+HttpDownloader::DownloadError downloadIncoming(const std::string& base, uint32_t deadline) {
   // openFileForWrite uses O_CREAT only (no parent-dir creation); a fresh device
   // that never received an M1 web upload has no /.love-notes yet, so ensure it.
   Storage.ensureDirectoryExists(NOTES_DIR);
-  return HttpDownloader::downloadToFile(base + SUFFIX_FRAME, INCOMING_FRAME);
+  return HttpDownloader::downloadToFile(base + SUFFIX_FRAME, INCOMING_FRAME, nullptr, nullptr, "", "", deadline);
 }
 
 // Validate the staged bytes and promote them. Pure SD work -- callers turn WiFi
@@ -199,13 +220,21 @@ bool promoteIncoming(const std::string& latestId, size_t frameBufferSize) {
 // Because the machine is stepped from the same task that dispatches input, a
 // cancel can only ever land BETWEEN steps -- never mid-transfer. That is what
 // makes "WiFi is down before the reader is constructed" a structural guarantee
-// rather than a race, and it is why downloadToFile needs no cancel flag here.
+// rather than a race, and it is why the transfers take a deadline rather than a
+// cancel flag: there is nobody to poll the flag while they run. The deadline is
+// what bounds them, and the phase budgets below are therefore also the worst-case
+// input latency at the launcher -- see WAKE_PROBE_BUDGET_MS.
 enum class WakeStep : uint8_t { Idle, Settle, Connect, Probe, Download };
 
 struct WakeCheck {
   WakeStep step = WakeStep::Idle;
   size_t frameSize = 0;
-  uint32_t deadline = 0;     // millis() deadline for the whole check
+  // millis() deadline for the CURRENT phase, re-armed on each transition. Per
+  // phase rather than per check because the two HTTP steps are single blocking
+  // calls: a whole-check deadline that has nearly expired by the time Download
+  // starts would either kill the transfer before it began or, if it were only
+  // tested between steps, bound nothing at all.
+  uint32_t phaseDeadline = 0;
   uint32_t settleUntil = 0;  // mirrors connectHeadless's post-disconnect settle
   std::string base;
   std::string latestId;
@@ -216,41 +245,27 @@ struct WakeCheck {
 };
 WakeCheck wake;
 
-// Whole-check budget: section 3A prices the window at "connect <= 6 s + one TLS
+// Connect budget: section 3A prices the window at "connect <= 6 s + one TLS
 // handshake, 8 s worst case", and requires the caller to enforce it against
-// millis() rather than leaning on the 60 s per-socket-op timeout.
-constexpr uint32_t WAKE_DEADLINE_MS = 8000;
+// millis() rather than leaning on the 60 s per-socket-op timeout. Polled, so it
+// never blocks input.
+constexpr uint32_t WAKE_CONNECT_BUDGET_MS = 8000;
 
-// Best-effort wall-clock throttle. The *structural* throttle is the real one:
-// at most one check per wake, and only on the launcher branch -- enforced by the
-// single beginWakeCheck() call site. This adds a second guard for the user who
-// wakes to the launcher repeatedly in a short span, and it deliberately fails
-// OPEN: HalClock exposes hour+minute only, and only when an RTC is present
-// (lib/hal/HalClock.h:25-29), so the stamp is absent on some units and wraps at
-// midnight. It suppresses a check only when the elapsed minutes are unambiguous.
-constexpr int16_t WAKE_THROTTLE_MINUTES = 30;
-
-bool wakeThrottleAllows() {
-  uint8_t hour = 0, minute = 0;
-  if (!halClock.isAvailable() || !halClock.getTime(hour, minute)) return true;  // no clock -> fail open
-  const int16_t nowMinute = static_cast<int16_t>(hour) * 60 + static_cast<int16_t>(minute);
-  const int16_t last = APP_STATE.messageCheckMinuteOfDay;
-  if (last >= 0 && last < 1440) {
-    const int16_t elapsed = static_cast<int16_t>(nowMinute - last);
-    // A negative delta means the clock wrapped past midnight (or was set back):
-    // ambiguous, so allow the check rather than guess.
-    if (elapsed >= 0 && elapsed < WAKE_THROTTLE_MINUTES) {
-      LOG_DBG("MSYNC", "Wake check throttled (%d min since last)", static_cast<int>(elapsed));
-      return false;
-    }
-  }
-  // Stamp on arming, not on success: a failed connect costs the same radio time
-  // as a successful one, so it must throttle the next wake too. This is the only
-  // SD write the wake path incurs, and only on units that have an RTC.
-  APP_STATE.messageCheckMinuteOfDay = nowMinute;
-  APP_STATE.saveToFile();
-  return true;
-}
+// Budgets for the two BLOCKING steps, and therefore the worst-case input freeze
+// at the launcher: the machine is stepped from the task that dispatches input, so
+// while one of these calls is in flight nothing is dispatched. They are the reason
+// the numbers are this small -- 3A rejected B1 because "a blocking connectHeadless
+// on the main task freezes input for up to 6 s -- unacceptable at the launcher",
+// and an unbounded HTTP call is the same defect with a worse constant.
+//
+// latest.txt is <= 128 B by contract, so its cost is one handshake plus a round
+// trip. The frame is 52272 B on the X3 (48000 on the X4); at the contract's
+// 30 KB/s pessimistic floor that is ~1.8 s, and 5 s covers a handshake on top.
+// A deadline hit mid-frame costs nothing but the radio time: the bytes went to
+// INCOMING_FRAME, so the note is simply re-fetched on the next wake or staged by
+// the sleep-entry sync.
+constexpr uint32_t WAKE_PROBE_BUDGET_MS = 3000;
+constexpr uint32_t WAKE_FRAME_BUDGET_MS = 5000;
 
 void wakeFinish(const char* why) {
   if (wake.step == WakeStep::Idle) return;
@@ -299,7 +314,7 @@ int wakeConnectStep() {
 }
 }  // namespace
 
-bool MessageSync::syncBeforeSleep(size_t frameBufferSize, const LinkUpHook& whileLinkUp) {
+bool MessageSync::syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, const LinkUpHook& whileLinkUp) {
   if (!SETTINGS.messageSyncEnabled) return false;
   const std::string base = baseUrl();
   if (base.empty()) return false;
@@ -310,12 +325,16 @@ bool MessageSync::syncBeforeSleep(size_t frameBufferSize, const LinkUpHook& whil
   }
 
   // The note half runs to completion first, unconditionally: it is tiny and
-  // latency-sensitive, and it must never queue behind a book.
+  // latency-sensitive, and it must never queue behind a book. Both of its HTTP
+  // calls are bounded from HERE -- i.e. from the moment the link came up, so the
+  // connect's own <= 6 s budget is not double-charged -- and never past the
+  // caller's deadline.
+  const uint32_t noteDeadline = deadlineWithin(deadline, NOTE_PHASE_BUDGET_MS);
   bool staged = false;
   std::string latestId;
-  if (probeLatest(base, latestId) == Probe::NewNote) {
+  if (probeLatest(base, latestId, noteDeadline) == Probe::NewNote) {
     LOG_INF("MSYNC", "New note %s: downloading frame", latestId.c_str());
-    const HttpDownloader::DownloadError err = downloadIncoming(base);
+    const HttpDownloader::DownloadError err = downloadIncoming(base, noteDeadline);
     if (err != HttpDownloader::OK) {
       LOG_ERR("MSYNC", "frame download failed (%d)", static_cast<int>(err));
       Storage.remove(INCOMING_FRAME);
@@ -346,14 +365,13 @@ void MessageSync::beginWakeCheck(size_t frameBufferSize) {
     LOG_DBG("MSYNC", "No saved WiFi credentials");
     return;
   }
-  if (!wakeThrottleAllows()) return;
 
   wake = WakeCheck{};
   wake.step = WakeStep::Settle;
   wake.frameSize = frameBufferSize;
   wake.base = std::move(base);
   wake.lastSsid = WIFI_STORE.getLastConnectedSsid();
-  wake.deadline = millis() + WAKE_DEADLINE_MS;
+  wake.phaseDeadline = millis() + WAKE_CONNECT_BUDGET_MS;
   wake.settleUntil = millis() + 100;
   wifiBeginSta();
   LOG_DBG("MSYNC", "Wake check armed");
@@ -361,7 +379,7 @@ void MessageSync::beginWakeCheck(size_t frameBufferSize) {
 
 void MessageSync::stepWakeCheck() {
   if (wake.step == WakeStep::Idle) return;
-  if (static_cast<int32_t>(millis() - wake.deadline) >= 0) {
+  if (static_cast<int32_t>(millis() - wake.phaseDeadline) >= 0) {
     wakeFinish("deadline");
     return;
   }
@@ -378,25 +396,28 @@ void MessageSync::stepWakeCheck() {
         wakeFinish("no network");
       } else if (result > 0) {
         wake.step = WakeStep::Probe;
+        wake.phaseDeadline = millis() + WAKE_PROBE_BUDGET_MS;
       }
       return;
     }
 
     case WakeStep::Probe: {
-      // One tiny GET plus the single TLS handshake. Blocking, but short.
+      // One tiny GET plus the single TLS handshake. Blocking, so bounded by the
+      // deadline it is handed -- nothing polls input while it runs.
       std::string latestId;
-      if (probeLatest(wake.base, latestId) != Probe::NewNote) {
+      if (probeLatest(wake.base, latestId, wake.phaseDeadline) != Probe::NewNote) {
         wakeFinish("nothing new");
         return;
       }
       wake.latestId = std::move(latestId);
       wake.step = WakeStep::Download;
+      wake.phaseDeadline = millis() + WAKE_FRAME_BUDGET_MS;
       return;
     }
 
     case WakeStep::Download: {
       LOG_INF("MSYNC", "Wake check: new note %s, downloading frame", wake.latestId.c_str());
-      const HttpDownloader::DownloadError err = downloadIncoming(wake.base);
+      const HttpDownloader::DownloadError err = downloadIncoming(wake.base, wake.phaseDeadline);
       // Radio off before the SD promote and before control returns to the
       // launcher: WiFi and a chapter build must never be resident at once.
       wifiOff();
@@ -406,6 +427,14 @@ void MessageSync::stepWakeCheck() {
       } else {
         promoteIncoming(wake.latestId, wake.frameSize);
       }
+      // The one number that decides whether Path B is safe to arm when a book is
+      // one keypress away: WiFi.mode(WIFI_OFF) does not defragment the heap and
+      // silentRestart() is not available at the launcher, so if a post-check
+      // chapter build OOMs there is no recovery. Logged on the completed path
+      // (the expensive one -- a TLS session plus a 52 KB SD write) so the arm
+      // condition in main.cpp can be decided on a measurement instead of a guess.
+      LOG_INF("MSYNC", "Post-check heap: free %u, min free %u, max alloc %u", (unsigned)ESP.getFreeHeap(),
+              (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
       wakeFinish("done");
       return;
     }

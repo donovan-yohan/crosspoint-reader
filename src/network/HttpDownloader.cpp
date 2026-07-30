@@ -30,7 +30,12 @@ constexpr int HTTP_TX_BUF = 512;
 // (>15s) and chunked catalogs stall mid-body, so 15s killed them. 60s gives
 // slow servers room. esp_http_client's timeout_ms is uint32, so unlike Arduino
 // HTTPClient's uint16 setTimeout it doesn't silently truncate.
-constexpr int HTTP_TIMEOUT_MS = 60000;
+constexpr uint32_t HTTP_TIMEOUT_MS = 60000;
+// Floor for a timeout clamped against a caller deadline. SecureHttpClient divides
+// its timeout by 1000 for the connect phase (SecureHttpClient.h:403-408), so a
+// sub-second value rounds to a 0 s connect timeout, which the underlying
+// WiFiClient reads as "fail immediately" rather than "no timeout".
+constexpr uint32_t MIN_SOCKET_TIMEOUT_MS = 1000;
 constexpr size_t READ_CHUNK = 1024;
 constexpr int MAX_REDIRECTS = 5;
 
@@ -68,6 +73,30 @@ bool sinkExpired(const Sink& sink) {
   return sink.deadlineMs != 0 && static_cast<int32_t>(millis() - sink.deadlineMs) >= 0;
 }
 
+// Per-socket-op timeout for one request, clamped to what is left of the caller's
+// window. sinkExpired() bounds the body read loop, but NOTHING polls it during
+// connect: SecureHttpClient checks the abort callback once, immediately before
+// ensureConnected() (SecureHttpClient.h:211), and the connect itself does not
+// poll. So for the connect phase the socket timeout is the only bound there is,
+// and a fixed 60 s is not a usable one inside an 8 s window (contract section 5
+// gap G7: "do not rely on the socket timeout as a window bound").
+//
+// What this actually reaches: the status-line/header read deadline and the
+// inter-read stall deadline in every body reader, plus the TCP connect on the
+// plain-http path (_plain is a WiFiClient, whose setTimeout does bound connect).
+// It does NOT reach the wolfSSL handshake -- SecureClient does not override
+// setTimeout and caps its own handshake at an internal 15 s per method attempt
+// (SecureClient.cpp) -- so https adds that much irreducible slop past the
+// deadline on a connect that hangs. Never returns 0: see MIN_SOCKET_TIMEOUT_MS.
+uint32_t socketTimeoutFor(const Sink& sink) {
+  if (sink.deadlineMs == 0) return HTTP_TIMEOUT_MS;
+  const int32_t remaining = static_cast<int32_t>(sink.deadlineMs - millis());
+  if (remaining <= 0) return MIN_SOCKET_TIMEOUT_MS;
+  const uint32_t budget = static_cast<uint32_t>(remaining);
+  if (budget >= HTTP_TIMEOUT_MS) return HTTP_TIMEOUT_MS;
+  return budget < MIN_SOCKET_TIMEOUT_MS ? MIN_SOCKET_TIMEOUT_MS : budget;
+}
+
 // Total size out of a Content-Range value. Handles both forms the contract can
 // emit: "bytes 655360-1874232/1874233" (206) and "bytes */1874233" (416).
 // Returns 0 for an absent header or an unknown ("*") total.
@@ -84,8 +113,11 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
   std::string url = startUrl;
 
   for (int hop = 0; hop <= MAX_REDIRECTS; ++hop) {
+    // Checked before the connect, not only inside the body loop: a redirect chain
+    // pays a fresh connect per hop and each one is unabortable once started.
+    if (sinkExpired(sink)) return HttpDownloader::ABORTED;
     freeink::SecureHttpClient http;
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setTimeout(socketTimeoutFor(sink));
     http.setInsecure();
     if (!http.begin(url)) {
       LOG_ERR("HTTP", "wolfSSL bad URL: %s", url.c_str());
@@ -128,7 +160,18 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
             // On a 206 Content-Length is the SLICE length, not the file size, so
             // a resume at 90% would otherwise report progress starting from 0.
             if (sink.acceptPartial) sink.total = contentRangeTotal(http.getHeader("content-range"));
-            if (sink.total == 0 && http.hasContentLength()) sink.total = http.getContentLength();
+            if (sink.total == 0 && http.hasContentLength()) {
+              sink.total = http.getContentLength();
+              // Content-Range was absent or unparseable and we fell back to
+              // Content-Length. On a 206 that is the slice, and the range is
+              // always open-ended ("bytes=N-"), so the resource size is exactly
+              // rangeStart + slice. Without this correction the caller sees a
+              // resource "smaller than the manifest says" and, in BookSync, that
+              // means "the blob was replaced under this id" -- it deletes every
+              // byte fetched so far, on every window. Mirrors the esp_http_client
+              // path (runGet below), which has always done this.
+              if (bodyStatus == 206 && sink.total > 0) sink.total += sink.rangeStart;
+            }
           }
           if (!sink.write(data, len)) return false;
           sink.downloaded += len;
@@ -195,7 +238,9 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   config.url = url.c_str();
   config.buffer_size = HTTP_RX_BUF;
   config.buffer_size_tx = HTTP_TX_BUF;
-  config.timeout_ms = HTTP_TIMEOUT_MS;
+  // Clamped to the caller's remaining window for the same reason as the wolfSSL
+  // path: open() is not abortable, so the socket timeout is its only bound.
+  config.timeout_ms = static_cast<int>(socketTimeoutFor(sink));
   // Verify HTTPS against the bundled CA roots. This build has esp-tls
   // CONFIG_ESP_TLS_INSECURE off, so an unverified TLS handshake can't be set
   // up at all; the model is public servers over verified https and local
@@ -333,10 +378,11 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
-                              const std::string& password) {
+                              const std::string& password, uint32_t deadlineMs) {
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
   outContent.clear();  // start clean; the sink appends, so don't carry prior content
   Sink sink;
+  sink.deadlineMs = deadlineMs;
   sink.write = [&outContent](const uint8_t* data, size_t len) {
     outContent.append(reinterpret_cast<const char*>(data), len);
     return true;
@@ -355,7 +401,8 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
 
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, bool* cancelFlag,
-                                                             const std::string& username, const std::string& password) {
+                                                             const std::string& username, const std::string& password,
+                                                             uint32_t deadlineMs) {
   LOG_DBG("HTTP", "Downloading: %s -> %s", url.c_str(), destPath.c_str());
 
   if (Storage.exists(destPath.c_str())) {
@@ -370,6 +417,7 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   Sink sink;
   sink.progress = std::move(progress);
   sink.cancelFlag = cancelFlag;
+  sink.deadlineMs = deadlineMs;
   sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
 
   const DownloadError result = runGetSecure(url, username, password, sink);
@@ -402,7 +450,17 @@ HttpDownloader::RangeResult HttpDownloader::resumeToFile(const std::string& url,
   // oflag path and seek explicitly instead of relying on an append flag -- the
   // SdFat oflag set is not vendored here, so only the flags with in-tree
   // precedent (HalSystem.cpp, Dictionary.cpp) are used.
-  HalFile file = Storage.open(destPath.c_str(), O_WRITE | O_CREAT);
+  //
+  // O_TRUNC exactly when rangeStart == 0, i.e. when the caller means "start this
+  // file over". Without it a stale file LONGER than the new body keeps its tail:
+  // only the prefix is overwritten, a later window reads the stale length via the
+  // caller's size probe, resumes from it, arrives at exactly the advertised size
+  // and promotes a file whose interior is garbage. The size gate is the only
+  // integrity gate the contract affords (no hash), so nothing downstream catches
+  // that. Reachable whenever a caller believes the partial is gone when it is not
+  // -- an unchecked remove(), or a size probe that returns 0 on a read failure.
+  const oflag_t oflag = rangeStart == 0 ? (O_WRITE | O_CREAT | O_TRUNC) : (O_WRITE | O_CREAT);
+  HalFile file = Storage.open(destPath.c_str(), oflag);
   if (!file) {
     LOG_ERR("HTTP", "Failed to open %s for resume", destPath.c_str());
     out.error = FILE_ERROR;

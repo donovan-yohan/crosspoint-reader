@@ -36,9 +36,17 @@ namespace MessageSync {
 // Connects to a saved WiFi network (last-connected first) under a hard fail-fast
 // deadline, does a cheap "latest id" GET, and only downloads + stages a
 // genuinely new frame (incoming -> validate size == frameBufferSize -> promote
-// current.frame + current.id). Always leaves WiFi off; never blocks beyond the
-// bounded connect deadline; leaves the last valid frame untouched on any
-// failure/timeout/no-net/no-creds/same-id.
+// current.frame + current.id). Always leaves WiFi off; leaves the last valid frame
+// untouched on any failure/timeout/no-net/no-creds/same-id.
+//
+// `deadline` is an absolute millis() timestamp capping the WHOLE call (0 = no cap,
+// which is only sane in a context that can afford to block for minutes -- there
+// isn't one). It bounds the note phase's own two HTTP calls, and it is the value
+// the books hook is expected to work to as well. Without it neither HTTP call has
+// any wall-clock bound: the note phase blocks on the calling task, so an AP that
+// associates but has no route to the mailbox would hold sleep entry -- panel
+// already showing the sleep screen, POWER doing nothing -- for as long as the
+// per-socket-op timeout allows.
 //
 // Returns true iff this call promoted a NEW frame -- the signal enterDeepSleep()
 // uses to decide whether the already-painted sleep screen needs one repaint.
@@ -55,18 +63,22 @@ namespace MessageSync {
 // ordering (notes first, always) and that WiFi is off when syncBeforeSleep
 // returns, whatever the hook did.
 using LinkUpHook = std::function<void(const std::string& base, bool stagedNewNote)>;
-bool syncBeforeSleep(size_t frameBufferSize, const LinkUpHook& whileLinkUp = nullptr);
+bool syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, const LinkUpHook& whileLinkUp = nullptr);
 
 // --- Path B: wake-side check (stepped, zero UI) -----------------------------
 // Arm one bounded check. Call from setup() ONLY on the branch that lands at the
-// launcher: WiFi and EPUB rendering must never be resident at once, so a wake
-// that resumes straight into the reader must not run a check. Silently no-ops
-// when disabled, unconfigured, without saved credentials, or throttled.
+// launcher AND has no book one keypress away: WiFi and EPUB rendering must never
+// be resident at once, and WIFI_OFF does not defragment the heap a TLS session
+// just fragmented. Silently no-ops when disabled, unconfigured, or without saved
+// credentials. There is no wall-clock throttle -- the throttle is structural, at
+// most one check per wake, enforced by the single call site.
 void beginWakeCheck(size_t frameBufferSize);
 
-// One non-blocking step of the armed check; call once per main-loop iteration.
-// The <= 6 s connect budget is polled rather than blocked on, so input stays
-// responsive at the launcher. No-op when nothing is armed.
+// One step of the armed check; call once per main-loop iteration. The <= 6 s
+// connect budget is polled rather than blocked on. The two HTTP steps DO block the
+// calling task, but each is bounded by its own phase budget (3 s probe, 5 s frame),
+// so that is the worst-case input latency they can add. No-op when nothing is
+// armed.
 void stepWakeCheck();
 
 // Abandon an armed check and tear WiFi down immediately. Mandatory before any

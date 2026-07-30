@@ -37,9 +37,13 @@ class HttpDownloader {
 
   /**
    * Fetch text content from a URL with optional credentials.
+   *
+   * `deadlineMs` is an absolute millis() timestamp (0 = none). Only pass a body
+   * this small (a few hundred bytes) through here: the whole response is buffered
+   * in the returned string.
    */
   static bool fetchUrl(const std::string& url, std::string& outContent, const std::string& username = "",
-                       const std::string& password = "");
+                       const std::string& password = "", uint32_t deadlineMs = 0);
 
   static bool fetchUrl(const std::string& url, Stream& stream, const std::string& username = "",
                        const std::string& password = "");
@@ -60,10 +64,17 @@ class HttpDownloader {
    * Truncating and one-shot: destPath is removed before the transfer and again
    * on any failure. Callers resuming across several windows want resumeToFile()
    * instead -- for them the partial file IS the state and must never be dropped.
+   *
+   * `deadlineMs` is an absolute millis() timestamp (0 = none) enforced inside the
+   * body read loop, so a caller working to a window budget is not left with only
+   * the 60 s per-socket-op timeout as a bound. Independent of `cancelFlag`: a
+   * caller that cannot poll (one blocking call on the input task) needs the
+   * deadline, a caller with a UI loop wants both.
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr,
-                                      const std::string& username = "", const std::string& password = "");
+                                      const std::string& username = "", const std::string& password = "",
+                                      uint32_t deadlineMs = 0);
 
   struct RangeResult {
     DownloadError error = HTTP_ERROR;
@@ -79,10 +90,14 @@ class HttpDownloader {
    *
    * Sends `Range: bytes=<rangeStart>-` when rangeStart > 0 and accepts both 206
    * and 200 (a server that ignores the header answers 200 with the whole body,
-   * which is legal -- the caller must then restart from 0). destPath is opened
-   * O_WRITE|O_CREAT and seeked, never truncated, and is NEVER removed by this
-   * function on any outcome: for a multi-window resume the partial file is the
-   * only record of progress.
+   * which is legal -- the caller must then restart from 0). destPath is NEVER
+   * removed by this function on any outcome: for a multi-window resume the partial
+   * file is the only record of progress.
+   *
+   * rangeStart > 0 opens O_WRITE|O_CREAT and seeks, so the bytes already there are
+   * preserved. rangeStart == 0 means "start over" and adds O_TRUNC, so a stale
+   * file longer than the new body cannot leave its tail behind for a later window
+   * to mistake for progress.
    *
    * `deadlineMs` is an absolute millis() timestamp (0 = none) enforced inside
    * the body read loop, so it bounds a stalled socket too -- the 60 s

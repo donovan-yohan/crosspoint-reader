@@ -176,11 +176,18 @@ constexpr char SLEEP_FRAME_FILE[] = "/.crosspoint/sleep_frame.bin";
 // Hard cap on the whole sleep-entry sync: connect + notes + the A2 repaint +
 // the books window. The contract's own headline number -- ~8 s of fixed cost
 // (<= 6 s connect plus a TLS handshake) plus BookSync::WINDOW_BUDGET_MS of
-// transfer -- and it is a wall-clock bound enforced inside the body read loops,
-// not a hope based on the 60 s per-socket-op timeout. The panel already shows
-// the sleep screen for all of it, so the device looks asleep throughout; that is
-// exactly why the number must stay small enough that a POWER press landing
-// inside the window is a rare annoyance rather than the normal experience.
+// transfer. It is a wall-clock bound, passed into syncBeforeSleep and enforced
+// inside every body read loop under it (both halves: the note GETs take it too),
+// not a hope based on the 60 s per-socket-op timeout. One documented exception,
+// and only for an https mailbox: the wolfSSL handshake caps itself internally at
+// 15 s per method attempt and nothing outside SecureClient can shorten that, so a
+// connect that hangs mid-handshake can overrun this by that much. Everything else
+// -- DNS/TCP connect, status line, body, stalls -- is clamped to what is left.
+//
+// The panel already shows the sleep screen for all of it, so the device looks
+// asleep throughout; that is exactly why the number must stay small enough that a
+// POWER press landing inside the window is a rare annoyance rather than the normal
+// experience.
 constexpr uint32_t SLEEP_SYNC_WINDOW_MS = 8000 + BookSync::WINDOW_BUDGET_MS;
 
 static void saveSleepFrameBuffer() {
@@ -239,7 +246,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   // handshake are paid once for both halves. The whole window -- connect, notes,
   // the A2 repaint and books -- is capped at SLEEP_SYNC_WINDOW_MS from here.
   const uint32_t sleepSyncDeadline = millis() + SLEEP_SYNC_WINDOW_MS;
-  MessageSync::syncBeforeSleep(display.getBufferSize(), [&](const std::string& base, const bool stagedNewNote) {
+  const MessageSync::LinkUpHook whileLinkUp = [&](const std::string& base, const bool stagedNewNote) {
     // M2 #2 Path A2 (contract section 3A): goToSleep() above painted the sleep
     // screen BEFORE the sync, so a note that just landed is staged but is not on
     // the panel yet. Repaint it exactly once, and only on the sleeps where a note
@@ -273,7 +280,8 @@ void enterDeepSleep(bool fromTimeout = false) {
     // across windows, promoted only on an exact size match. Returns early when
     // too little budget survives the note phase to be worth a handshake.
     BookSync::syncOnLink(base, sleepSyncDeadline);
-  });
+  };
+  MessageSync::syncBeforeSleep(display.getBufferSize(), sleepSyncDeadline, whileLinkUp);
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
@@ -546,7 +554,20 @@ void setup() {
   // observable effect is that the NEXT sleep-entry has a newer note to lock with.
   // Nothing is fetched here; stepWakeCheck() in loop() does the work, and any
   // activity transition cancels it with the radio down (ActivityManager).
-  if (landedAtLauncher) {
+  //
+  // The openEpubPath gate is the heap-ordering rule from contract 3A. landedAtLauncher
+  // alone is not enough: three of its four causes (last sleep not from the reader,
+  // Back held, a reader crash) leave openEpubPath NON-empty, and in all three the
+  // user's first action at the launcher is to reopen that book -- so a chapter build
+  // would run on a heap a TLS session had just fragmented. WIFI_OFF does not
+  // defragment and silentRestart() cannot be used here (it would trample the
+  // launcher), so there would be no recovery from an OOM. Arming only when no book
+  // is one keypress away costs those wakes their silent check -- the note then
+  // arrives on the sleep-entry sync instead, i.e. no worse than before Path B
+  // existed. Loosening this needs the post-check heap number stepWakeCheck() now
+  // logs, measured on a device against a following chapter build; there is no
+  // runtime evidence for the tighter version either way.
+  if (landedAtLauncher && APP_STATE.openEpubPath.empty()) {
     MessageSync::beginWakeCheck(display.getBufferSize());
   }
 }
