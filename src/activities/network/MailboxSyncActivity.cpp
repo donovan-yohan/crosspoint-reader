@@ -7,23 +7,32 @@
 #include <esp_random.h>
 
 #include <cstdio>
+#include <string_view>
 
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "SilentRestart.h"
+#include "WifiCredentialStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/BookSync.h"
+#include "network/HttpDownloader.h"
 #include "network/MessageSync.h"
 #include "network/PeerProbe.h"
 #include "util/QrUtils.h"
 #include "util/TaskWatchdog.h"
 
+using MailboxSync::MAX_WIFI_BODY_BYTES;
 using MailboxSync::PEER_DISCOVERY_MS;
 using MailboxSync::PHONE_JOIN_WAIT_MS;
 using MailboxSync::POLL_INTERVAL_MS;
+using MailboxSync::PSK_MAX_BYTES;
+using MailboxSync::PSK_MIN_BYTES;
 using MailboxSync::SESSION_CAP_MS;
+using MailboxSync::SSID_MAX_BYTES;
 using MailboxSync::Transport;
+using MailboxSync::WIFI_PICKUP_BUDGET_MS;
+using MailboxSync::WIFI_SHARE_PATH;
 
 namespace {
 // The SSID the app's WifiNetworkSpecifier matches on, deliberately the same
@@ -163,6 +172,77 @@ std::string humanBytes(size_t bytes) {
 // std::hash over the visible name, so the paint signature can compare "is the
 // screen still showing the same book" without keeping a second copy of the string.
 size_t hashName(const std::string& s) { return std::hash<std::string>{}(s); }
+
+// Origin of a composed peer base: "http://192.168.4.2:8080/m/abc" -> the part
+// before "/m". The exact complement of PeerProbe::pathOf, which is what appended
+// that path in the first place, so this cannot disagree with it about where the
+// authority ends -- including on a base that carries a port, where a naive
+// "find the first slash" would stop at the scheme's own "//".
+std::string originOf(const std::string& url) {
+  const size_t schemeEnd = url.find("://");
+  const size_t authorityStart = (schemeEnd == std::string::npos) ? 0 : schemeEnd + 3;
+  const size_t slash = url.find('/', authorityStart);
+  return slash == std::string::npos ? url : url.substr(0, slash);
+}
+
+// One trailing CR, so the app may end its lines CRLF or LF.
+std::string_view stripCr(std::string_view line) {
+  if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+  return line;
+}
+
+// Split "ssid\npassword\n" and judge both halves. Returns false without touching
+// the outputs for anything the reader will not save, which is the whole point:
+// this is the only gate between a station on the AP and a network entry on the
+// card, and the caller does not ack what it did not accept.
+bool parseWifiPayload(const std::string& body, std::string& ssid, std::string& password) {
+  const size_t firstNl = body.find('\n');
+  if (firstNl == std::string::npos) return false;  // one line is not this contract
+  const size_t secondNl = body.find('\n', firstNl + 1);
+
+  const std::string_view view(body);
+  const std::string_view ssidLine = stripCr(view.substr(0, firstNl));
+  const std::string_view pskLine = stripCr(secondNl == std::string::npos
+                                               ? view.substr(firstNl + 1)
+                                               : view.substr(firstNl + 1, secondNl - firstNl - 1));
+
+  // STRICT ABOUT WHAT FOLLOWS, unlike PeerProbe's health body which tolerates
+  // anything after its token. That probe only decides "is this the app"; this one
+  // writes a network to the card. Without this check an HTML error page or a JSON
+  // document served with a 200 has its first two lines read as a credential, and a
+  // second line that happens to be 8..63 printable characters is all it takes to
+  // plant a network the user never typed.
+  if (secondNl != std::string::npos) {
+    for (size_t i = secondNl + 1; i < body.size(); ++i) {
+      const char c = body[i];
+      if (c != '\n' && c != '\r' && c != ' ' && c != '\t') return false;
+    }
+  }
+
+  if (ssidLine.empty() || ssidLine.size() > SSID_MAX_BYTES) return false;
+  // Control bytes cannot come out of a text field on the phone and cannot be drawn
+  // on the panel. High bytes are deliberately left alone: an SSID is arbitrary
+  // octets and a UTF-8 network name is an ordinary thing to own.
+  for (const char c : ssidLine) {
+    const auto b = static_cast<unsigned char>(c);
+    if (b < 0x20 || b == 0x7F) return false;
+  }
+
+  // Empty means the network is open. Anything else is a WPA passphrase, which the
+  // standard defines as 8..63 printable ASCII characters -- and which is exactly
+  // what softAP/begin will reject later, loudly and far from here, if it is not.
+  if (!pskLine.empty()) {
+    if (pskLine.size() < PSK_MIN_BYTES || pskLine.size() > PSK_MAX_BYTES) return false;
+    for (const char c : pskLine) {
+      const auto b = static_cast<unsigned char>(c);
+      if (b < 0x20 || b > 0x7E) return false;
+    }
+  }
+
+  ssid.assign(ssidLine);
+  password.assign(pskLine);
+  return true;
+}
 }  // namespace
 
 void MailboxSyncActivity::onEnter() {
@@ -490,6 +570,15 @@ void MailboxSyncActivity::runPollCycle() {
 
   resetTaskWatchdogIfSubscribed();
 
+  // THE WI-FI HANDOVER GOES FIRST, AND ONLY ONCE PER SESSION. It is the smallest
+  // request in the cycle -- one bounded local GET -- and it is the one the user is
+  // standing over the reader waiting for, whereas the note pass can block for ten
+  // seconds and the book window for thirty. Gated on the AP transport because the
+  // saved-network transport's origin is a public host on the internet, and gated
+  // on `wifiSavedSsid` because a handover that landed must not be re-applied every
+  // four seconds for the rest of the session.
+  if (transport == Transport::PhoneAp && wifiSavedSsid.empty()) tryWifiHandoff();
+
   // NOTES FIRST, ALWAYS -- the same ordering the sleep-entry window guarantees.
   // The frame is small and the note is the latency-sensitive half.
   const MessageSync::NoteResult note = MessageSync::syncOnLink(
@@ -566,6 +655,95 @@ void MailboxSyncActivity::runPollCycle() {
   }
 }
 
+void MailboxSyncActivity::tryWifiHandoff() {
+  const std::string origin = originOf(base);
+  if (origin.empty()) return;
+  const std::string url = origin + WIFI_SHARE_PATH;
+
+  // Latched, because a refusal deliberately does NOT stop the retries: the whole
+  // reason the reader does not ack a credential it cannot use is so a corrected
+  // one is still there to pick up. Without the latch that costs a log line every
+  // four seconds for the rest of the session.
+  const auto refuse = [this](const char* why) {
+    if (wifiRefusalLogged) return;
+    wifiRefusalLogged = true;
+    LOG_ERR("MSYNCUI", "Wi-Fi handover refused: %s", why);
+  };
+
+  std::string body;
+  bool overflowed = false;
+  // The bounded-body overload rather than the std::string one, for the same reason
+  // PeerProbe uses it: the thing being asked is a station on an AP, and returning
+  // false from the sink aborts the transfer instead of buffering whatever it feels
+  // like sending.
+  const bool ok = HttpDownloader::fetchUrl(
+      url,
+      [&body, &overflowed](const uint8_t* data, const size_t len) {
+        if (body.size() + len > MAX_WIFI_BODY_BYTES) {
+          overflowed = true;
+          return false;
+        }
+        body.append(reinterpret_cast<const char*>(data), len);
+        return true;
+      },
+      "", "", deadlineWithin(sessionDeadline, WIFI_PICKUP_BUDGET_MS));
+
+  if (!ok) {
+    // The overwhelmingly common answer here is a 404: the user has staged nothing,
+    // or the app is older than this path. fetchUrl reports that the same way it
+    // reports a refused connection, and it does not need to distinguish them --
+    // both mean "nothing to do this cycle", and both are silent, because a log
+    // line per poll for the ordinary case is noise rather than a record.
+    if (overflowed) refuse("the answer was too large to be a credential");
+    return;
+  }
+
+  std::string ssid;
+  std::string password;
+  if (!parseWifiPayload(body, ssid, password)) {
+    refuse("the answer is not a credential this reader can use");
+    return;
+  }
+
+  // LOAD BEFORE ADD, or the save inside addCredential() writes a file containing
+  // ONLY this network. The store is a singleton that outlives activities but is
+  // filled from the card lazily, and a device that went from boot straight into
+  // "Sync with app" has never loaded it -- every network the user has ever saved
+  // would be serialized away by a handover. MessageSync::connectSavedNetwork()
+  // opens with the same call for the same reason.
+  WIFI_STORE.loadFromFile();
+  if (!WIFI_STORE.addCredential(ssid, password)) {
+    // The eight-network store is full, or the card write failed. NO ACK: the
+    // credential stays staged on the phone, and a session with room takes it.
+    refuse("the credential could not be saved");
+    return;
+  }
+  // The user just told us this is the network they are standing in, which makes it
+  // the right first candidate for the next unattended sync.
+  WIFI_STORE.setLastConnectedSsid(ssid);
+  // The SSID is in every beacon this reader can hear, so naming it costs nothing.
+  // THE PASSWORD IS NEVER LOGGED, at any level, redacted or otherwise -- it is the
+  // one secret this whole feature exists to move, and a log is a file on a card
+  // somebody can read.
+  LOG_INF("MSYNCUI", "Wi-Fi credential saved from the app: %s", ssid.c_str());
+
+  // ACK, AND NEVER BEFORE THE SAVE. The app wipes its staging on this DELETE and
+  // on nothing else, so acking a credential that is not on the card yet is exactly
+  // how a handover is lost with nothing left to retry from. Best effort in the
+  // other direction: the credential IS on the card now, so an ack that does not
+  // land costs one duplicate handover next session and nothing the user sees.
+  if (!HttpDownloader::deleteUrl(url, deadlineWithin(sessionDeadline, WIFI_PICKUP_BUDGET_MS))) {
+    LOG_INF("MSYNCUI", "The app did not acknowledge the handover; it may offer the same network again");
+  }
+
+  wifiSavedSsid = ssid;
+  // Painted here rather than left to the paint at the end of the poll cycle: the
+  // note pass and the book window between this line and that one are up to forty
+  // seconds of the panel saying nothing about the one thing the user is watching
+  // for. Same argument as the book-target paint below, and it is still one frame.
+  paintIfChanged();
+}
+
 bool MailboxSyncActivity::pollForAbort() {
   if (exiting) return true;
 
@@ -606,7 +784,8 @@ void MailboxSyncActivity::teardownRadio() {
 // --- Paint -----------------------------------------------------------------
 
 MailboxSyncActivity::PaintSignature MailboxSyncActivity::signature() const {
-  return PaintSignature{state, hashName(targetName), targetHave, notesStaged, booksReceived, failureText};
+  return PaintSignature{state,         hashName(targetName), targetHave, notesStaged,
+                        booksReceived, failureText,          hashName(wifiSavedSsid)};
 }
 
 void MailboxSyncActivity::paintIfChanged() {
@@ -702,6 +881,18 @@ void MailboxSyncActivity::renderBody(const int contentTop) const {
            tr(STR_SYNC_BOOKS_LABEL), booksReceived);
   renderer.drawCenteredText(UI_10_FONT_ID, y, counts);
   y += lineHeight;
+
+  // The network the phone handed over, named, because it is the one thing in this
+  // whole mode the user cannot verify anywhere else until they next need it. Shown
+  // only after the credential is actually on the card -- the line is a receipt, not
+  // a promise.
+  if (!wifiSavedSsid.empty()) {
+    y += metrics.verticalSpacing;
+    char wifiLine[128];
+    snprintf(wifiLine, sizeof(wifiLine), "%s %s", tr(STR_SYNC_WIFI_SAVED), wifiSavedSsid.c_str());
+    renderer.drawCenteredText(SMALL_FONT_ID, y, wifiLine);
+    y += lineHeight;
+  }
 
   // Why the note the user just saw arrive is not on the screen. Shown only once a
   // note has actually been staged, so it reads as an explanation rather than as an

@@ -59,6 +59,21 @@ class HttpDownloader {
                        const std::string& password = "", uint32_t deadlineMs = 0);
 
   /**
+   * DELETE a URL and report whether the server answered 2xx.
+   *
+   * For acks, not for transfers: no body is sent, and the response body is read
+   * and thrown away up to a small cap (a server that answers an ack with a
+   * stream is answering wrong, and the transfer is aborted rather than
+   * buffered). The status is what the caller gets, because that is the whole
+   * content of an acknowledgement.
+   *
+   * `deadlineMs` is an absolute millis() timestamp (0 = none), clamped into the
+   * per-socket-op timeout exactly as the fetches above do -- an ack is issued
+   * from inside somebody's window budget and must not be able to outlive it.
+   */
+  static bool deleteUrl(const std::string& url, uint32_t deadlineMs = 0);
+
+  /**
    * Download a file to the SD card with optional credentials.
    *
    * Truncating and one-shot: destPath is removed before the transfer and again

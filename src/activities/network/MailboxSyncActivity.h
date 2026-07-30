@@ -64,6 +64,50 @@ constexpr uint32_t SESSION_CAP_MS = 30UL * 60UL * 1000UL;
 constexpr uint32_t PHONE_JOIN_WAIT_MS = 120000;
 constexpr uint32_t PEER_DISCOVERY_MS = 8000;
 
+// WI-FI HANDOVER OVER THE PEER LINK -- the reason this feature exists is that a
+// Wi-Fi password is the single worst thing to type on e-ink. The phone already
+// knows the network the user is standing in, the user types the password ONCE
+// there, and the credential rides the link that is already up.
+//
+// THE WIRE, pinned here because the app half is in another repository:
+//   GET    {peerOrigin}/cp-wifi -> 200 "ssid\npassword\n" (text), or 404 when the
+//                                  user has staged nothing.
+//   DELETE {peerOrigin}/cp-wifi -> the reader's acknowledgement; the app wipes its
+//                                  staging on it and only on it.
+//
+// PEER ORIGIN, NOT THE MAILBOX BASE. Every other request in this activity goes to
+// base = origin + /m/{boxId}; this one goes to the ORIGIN and a fixed path, the
+// same boxId-free construction PeerProbe uses for its health probe. The capability
+// URL has no business in a request that is not a mailbox read, and keeping the
+// boxId off this path means an app that serves /cp-wifi does not have to be told
+// the box id to do it.
+//
+// AP TRANSPORT ONLY, and that is a security boundary rather than a convenience.
+// On the saved-network transport the origin is a public mailbox host somewhere on
+// the internet; asking it for the user's home Wi-Fi password would be absurd, and
+// accepting an answer would be a straightforward way to plant a network on the
+// reader. The pickup is gated on Transport::PhoneAp at its only call site.
+constexpr char WIFI_SHARE_PATH[] = "/cp-wifi";
+
+// Per-attempt wall-clock budget for both the pickup and the ack. Plain HTTP, one
+// hop, no route anywhere and ~100 bytes of payload: the same reasoning (and the
+// same number) as PeerProbe::CANDIDATE_BUDGET_MS.
+constexpr uint32_t WIFI_PICKUP_BUDGET_MS = 1500;
+
+// Largest body the reader will take from /cp-wifi. A legal answer is at most
+// 32 + 1 + 63 + 2 = 98 bytes; a peer that sends more is not answering this
+// contract, so the transfer is aborted rather than buffered.
+constexpr size_t MAX_WIFI_BODY_BYTES = 128;
+
+// What the reader will accept as a credential. SSID is 1..32 bytes (802.11), and
+// a WPA passphrase is 8..63 printable ASCII -- empty is allowed and means "this
+// network is open". Anything else is refused WITHOUT an ack, so it stays staged on
+// the phone and a corrected value is picked up on a later session rather than
+// silently lost.
+constexpr size_t SSID_MAX_BYTES = 32;
+constexpr size_t PSK_MIN_BYTES = 8;
+constexpr size_t PSK_MAX_BYTES = 63;
+
 enum class Transport : uint8_t {
   // Appendix A4: headless connect to a saved network (the canonical one being the
   // user's own phone hotspot), base = the configured mailbox URL.
@@ -132,6 +176,16 @@ class MailboxSyncActivity final : public Activity {
   int notesStaged = 0;
   int booksReceived = 0;
 
+  // The network handed over on this session, empty until one has been saved. Both
+  // the "did it happen" flag and the panel line, because there is exactly one
+  // handover per session by construction: the pickup is skipped once this is set.
+  std::string wifiSavedSsid;
+  // "The log already says we could not take what the app offered." A refusal
+  // leaves the credential staged on purpose (see SSID_MAX_BYTES above), so the
+  // pickup keeps retrying on the poll cadence -- and the line has to be latched or
+  // it repeats every four seconds for the rest of the session.
+  bool wifiRefusalLogged = false;
+
   uint32_t sessionDeadline = 0;  // Absolute millis(); set once the activity starts.
   uint32_t phoneWaitDeadline = 0;
   uint32_t nextPollAt = 0;
@@ -167,12 +221,13 @@ class MailboxSyncActivity final : public Activity {
     int notes;
     int books;
     StrId failure;
+    size_t wifiHash;
     bool operator==(const PaintSignature& o) const {
       return state == o.state && nameHash == o.nameHash && have == o.have && notes == o.notes && books == o.books &&
-             failure == o.failure;
+             failure == o.failure && wifiHash == o.wifiHash;
     }
   };
-  PaintSignature painted{State::Finished, 0, 0, -1, -1, StrId::STR_SYNC_FINISHED};
+  PaintSignature painted{State::Finished, 0, 0, -1, -1, StrId::STR_SYNC_FINISHED, 0};
 
   PaintSignature signature() const;
   // The ONLY paint call site. Blocking (requestUpdateAndWait) so the panel really
@@ -184,6 +239,11 @@ class MailboxSyncActivity final : public Activity {
   bool startPhoneApLink();
   void stepPhoneApLink();  // WaitingPhone -> Linking -> Polling, and back on a drop.
   void runPollCycle();
+  // One /cp-wifi pickup attempt, from the front of a poll cycle on the AP
+  // transport. Everything about it is non-fatal to the session: a 404 (nothing
+  // staged, or an app too old to serve the path) and a transport failure are the
+  // same "not this cycle", and neither touches the note poll's stall bookkeeping.
+  void tryWifiHandoff();
   void teardownRadio();
   // Polled from inside a book transfer so Back does not have to wait out the
   // window budget. Latches `exiting`; the transfer unwinds through the existing

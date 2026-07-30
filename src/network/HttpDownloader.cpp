@@ -399,6 +399,71 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   return runGetSecure(url, username, password, sink) == OK;
 }
 
+bool HttpDownloader::deleteUrl(const std::string& url, const uint32_t deadlineMs) {
+  LOG_DBG("HTTP", "DELETE: %s", url.c_str());
+  // Only deadlineMs is set: nothing here writes to a sink, and socketTimeoutFor()
+  // reads no other field. Reused rather than reimplemented so an ack is clamped by
+  // exactly the same rule as a fetch issued from the same window.
+  Sink sink;
+  sink.deadlineMs = deadlineMs;
+  if (sinkExpired(sink)) return false;
+
+  // An ack's answer is its status; the body is noise. Capped so a peer that
+  // answers a DELETE with a stream costs one aborted read rather than the heap.
+  constexpr size_t MAX_ACK_BODY = 256;
+
+#if defined(FREEINK_NET_WOLFSSL)
+  freeink::SecureHttpClient http;
+  http.setTimeout(socketTimeoutFor(sink));
+  http.setInsecure();
+  if (!http.begin(url)) {
+    LOG_ERR("HTTP", "wolfSSL bad URL: %s", url.c_str());
+    return false;
+  }
+  http.setUserAgent("CrossPoint-ESP32-" CROSSPOINT_VERSION);
+
+  size_t drained = 0;
+  const int status = http.sendRequest(
+      "DELETE", nullptr, 0,
+      [&drained](const uint8_t*, const size_t len) {
+        drained += len;
+        return drained <= MAX_ACK_BODY;
+      },
+      [&sink]() { return sinkExpired(sink); });
+  if (http.aborted()) return false;
+  return status >= 200 && status < 300;
+#else
+  // Dead code on every shipping env (all define FREEINK_NET_WOLFSSL), kept in
+  // step with the branch above. NOT covered by the compile gate.
+  (void)MAX_ACK_BODY;
+  esp_http_client_config_t config = {};
+  config.url = url.c_str();
+  config.buffer_size = HTTP_RX_BUF;
+  config.buffer_size_tx = HTTP_TX_BUF;
+  config.timeout_ms = static_cast<int>(socketTimeoutFor(sink));
+  config.crt_bundle_attach = esp_crt_bundle_attach;
+  config.method = HTTP_METHOD_DELETE;
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client) {
+    LOG_ERR("HTTP", "client init failed");
+    return false;
+  }
+  esp_http_client_set_header(client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+
+  const esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    LOG_ERR("HTTP", "DELETE open failed: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    return false;
+  }
+  esp_http_client_fetch_headers(client);
+  const int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
+  return status >= 200 && status < 300;
+#endif
+}
+
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, bool* cancelFlag,
                                                              const std::string& username, const std::string& password,
