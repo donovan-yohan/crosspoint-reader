@@ -1,6 +1,7 @@
 #include "MailboxSyncActivity.h"
 
 #include <GfxRenderer.h>
+#include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
@@ -28,6 +29,7 @@ using MailboxSync::PHONE_JOIN_WAIT_MS;
 using MailboxSync::POLL_INTERVAL_MS;
 using MailboxSync::PSK_MAX_BYTES;
 using MailboxSync::PSK_MIN_BYTES;
+using MailboxSync::WIFI_PICKUP_MAX_MISSES;
 using MailboxSync::SESSION_CAP_MS;
 using MailboxSync::SSID_MAX_BYTES;
 using MailboxSync::Transport;
@@ -553,6 +555,13 @@ void MailboxSyncActivity::stepPhoneApLink() {
     // drop-and-rejoin its one "Looking for the app..." paint back.
     consecutiveFailures = 0;
     probeAnnounced = false;
+    // A re-discovered base is the only point at which the thing on the other end
+    // can have become a different phone, or the same phone with something staged
+    // that was not staged before. It is therefore the one place the pickup's
+    // give-up latch is allowed to re-arm; anything cheaper would put the log
+    // flood back. The REFUSAL latch is deliberately not reset with it: a
+    // credential this reader cannot use is still the same credential.
+    wifiPickupMisses = 0;
     nextPollAt = millis();  // do not make the user wait a cadence for the first poll
     LOG_INF("MSYNCUI", "Peer link up");
     // Painted before the first poll rather than after it, or the panel would still
@@ -656,6 +665,17 @@ void MailboxSyncActivity::runPollCycle() {
 }
 
 void MailboxSyncActivity::tryWifiHandoff() {
+  // GIVE UP AFTER A FEW UNANSWERED PICKUPS, and do it before anything is spent.
+  //
+  // The overwhelmingly common session has nothing staged, so every pickup is a
+  // 404 -- and a 404 is NOT silent the way this used to claim: HttpDownloader
+  // logs every unexpected status at ERR unconditionally (see runGetWolf in
+  // src/network/HttpDownloader.cpp). Left unlatched, a 30 minute session for a
+  // user who never shares a network issues ~450 TCP connects and floods the
+  // serial console with ~450 ERR lines, each one holding up to
+  // WIFI_PICKUP_BUDGET_MS at the head of the latency-sensitive note pass.
+  if (wifiPickupMisses >= WIFI_PICKUP_MAX_MISSES) return;
+
   const std::string origin = originOf(base);
   if (origin.empty()) return;
   const std::string url = origin + WIFI_SHARE_PATH;
@@ -692,11 +712,20 @@ void MailboxSyncActivity::tryWifiHandoff() {
     // The overwhelmingly common answer here is a 404: the user has staged nothing,
     // or the app is older than this path. fetchUrl reports that the same way it
     // reports a refused connection, and it does not need to distinguish them --
-    // both mean "nothing to do this cycle", and both are silent, because a log
-    // line per poll for the ordinary case is noise rather than a record.
+    // both mean "nothing to do this cycle". This is the counter that stops the
+    // cycle repeating for the rest of the session; see WIFI_PICKUP_MAX_MISSES.
     if (overflowed) refuse("the answer was too large to be a credential");
+    if (++wifiPickupMisses >= WIFI_PICKUP_MAX_MISSES) {
+      // ONE line at the transition, not one per poll. It is the record that the
+      // pickup stopped being attempted, which is otherwise indistinguishable
+      // from a build without the feature when somebody is reading the console.
+      LOG_INF("MSYNCUI", "No Wi-Fi credential offered on this link; not asking again");
+    }
     return;
   }
+  // Answered. A later 404 on the same link starts the count over rather than
+  // adding to a stale one -- an answer proves the endpoint is there.
+  wifiPickupMisses = 0;
 
   std::string ssid;
   std::string password;
@@ -711,7 +740,27 @@ void MailboxSyncActivity::tryWifiHandoff() {
   // "Sync with app" has never loaded it -- every network the user has ever saved
   // would be serialized away by a handover. MessageSync::connectSavedNetwork()
   // opens with the same call for the same reason.
-  WIFI_STORE.loadFromFile();
+  //
+  // AND THE RESULT IS CHECKED, which is what makes "load before add" actually
+  // protect anything. PersistableStore::loadFromFile returns false WITHOUT
+  // touching `credentials` when readDocFromFile fails, and a truncated or
+  // corrupt /.crosspoint/wifi.json is exactly that case: the in-memory list
+  // stays empty, addCredential() saves, and every network the user had is gone.
+  // A missing file is NOT that case -- it is first boot, an empty store is the
+  // truth, and the handover is the right thing to write.
+  //
+  // Refusing here costs the user nothing: no ack goes back, so the credential
+  // stays staged on the phone and a session with a readable card takes it.
+  //
+  // The `empty()` term keeps it from being a FALSE refusal: a store already
+  // filled by an earlier successful load in this boot is correct in memory, and
+  // saving it back is not destructive no matter what the card says now.
+  const bool loaded = WIFI_STORE.loadFromFile();
+  if (!loaded && WIFI_STORE.getCredentials().empty() &&
+      Storage.exists(WifiCredentialStore::getFilePath())) {
+    refuse("the saved networks could not be read");
+    return;
+  }
   if (!WIFI_STORE.addCredential(ssid, password)) {
     // The eight-network store is full, or the card write failed. NO ACK: the
     // credential stays staged on the phone, and a session with room takes it.

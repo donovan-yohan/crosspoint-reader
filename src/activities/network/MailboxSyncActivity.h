@@ -99,6 +99,23 @@ constexpr uint32_t WIFI_PICKUP_BUDGET_MS = 1500;
 // contract, so the transfer is aborted rather than buffered.
 constexpr size_t MAX_WIFI_BODY_BYTES = 128;
 
+// How many consecutive unanswered pickups end the attempt for this link.
+//
+// The pickup runs at the head of every poll cycle, and for the overwhelming
+// majority of sessions there is nothing staged, so every one of them is a 404.
+// That is not free: each costs a TCP connect and up to WIFI_PICKUP_BUDGET_MS
+// ahead of the latency-sensitive note pass, and HttpDownloader logs every
+// non-200 at ERR unconditionally. Over a capped 30 minute session at the 4 s
+// cadence that is ~450 connects and ~450 ERR lines on the serial console, which
+// is the channel used to diagnose everything else about this mode.
+//
+// Three, and not one, because the phone's forwarder can answer the health probe
+// a moment before its own staging is armed. Three costs nothing in the sharing
+// case: the credential is staged before the session starts, so the FIRST pickup
+// finds it. Re-armed on peer re-discovery, which is the event that means "this
+// is a different link now".
+constexpr uint8_t WIFI_PICKUP_MAX_MISSES = 3;
+
 // What the reader will accept as a credential. SSID is 1..32 bytes (802.11), and
 // a WPA passphrase is 8..63 printable ASCII -- empty is allowed and means "this
 // network is open". Anything else is refused WITHOUT an ack, so it stays staged on
@@ -185,6 +202,11 @@ class MailboxSyncActivity final : public Activity {
   // pickup keeps retrying on the poll cadence -- and the line has to be latched or
   // it repeats every four seconds for the rest of the session.
   bool wifiRefusalLogged = false;
+  // Consecutive pickups that got no answer on THIS link. At
+  // WIFI_PICKUP_MAX_MISSES the pickup stops being attempted; reset when a peer
+  // base is (re)discovered, which is the only point at which the thing on the
+  // other end can have changed.
+  uint8_t wifiPickupMisses = 0;
 
   uint32_t sessionDeadline = 0;  // Absolute millis(); set once the activity starts.
   uint32_t phoneWaitDeadline = 0;
