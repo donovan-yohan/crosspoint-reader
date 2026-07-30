@@ -208,7 +208,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
-  activityManager.goToSleep(fromTimeout);
+  activityManager.goToSleep(fromTimeout);  // also cancels any armed Path B check
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
@@ -221,7 +221,30 @@ void enterDeepSleep(bool fromTimeout = false) {
   // enter here. Deep sleep fully resets the chip, so the post-WiFi fragmented
   // heap is discarded on the next wake -- no silentRestart needed. syncBeforeSleep
   // leaves WiFi off; the teardown below is a safety net.
-  MessageSync::syncBeforeSleep(display.getBufferSize());
+  const bool stagedNewNote = MessageSync::syncBeforeSleep(display.getBufferSize());
+
+  // M2 #2 Path A2 (contract section 3A): goToSleep() above painted the sleep
+  // screen BEFORE the sync, so a note that just landed is staged but is not on
+  // the panel yet. Repaint it exactly once, and only on the sleeps where a note
+  // actually arrived: the user walking away sees the wallpaper resolve into the
+  // note. Cost is one extra ~1.7 s HALF refresh, no radio. Keeping this ordering
+  // (paint, sync, repaint) rather than syncing first is deliberate -- syncing
+  // first would leave the last reading frame on the panel for the whole bounded
+  // WiFi window, so the device would look awake-but-frozen instead of asleep.
+  //
+  // Never on a quick-resume sleep: saveSleepFrameBuffer() above already
+  // snapshotted the pre-sync panel, so a repaint here would leave sleep_frame.bin
+  // (and, on the X3, the differential-refresh baseline restored from it at wake)
+  // desynced from what is physically on the panel. A quick-resume sleep means
+  // "put the screen back exactly as it was", so the note stays staged and locks
+  // the next normal sleep instead. SleepActivity::onEnter enforces the same rule
+  // on the selection side.
+  if (stagedNewNote && !isQuickResumeSleep) {
+    RenderLock lock;
+    if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    }
+  }
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
@@ -320,17 +343,13 @@ void setup() {
 
   APP_STATE.loadFromFile();
 
-  // Milestone 1/2 (messenger): if an UNREAD love-note frame is staged, queue it
-  // now as a deferred Push (currentActivity is null here, so it lands on top of
-  // the routing target below and Back dismisses to it). MessageSync::hasUnreadNote
-  // dedups by message id so a note shows exactly once, never on every wake (fixes
-  // a latent M1 bug). APP_STATE must be loaded first for the id comparison. The
-  // goToBoot() splash calls below are skipped when showLoveNote, so the note is
-  // the first screen shown.
-  const bool showLoveNote = MessageSync::hasUnreadNote();
-  if (showLoveNote) {
-    activityManager.goToMessage();
-  }
+  // M2 #2 (messenger, contract section 3A): there is deliberately NO wake-time
+  // note interrupt here any more. The newest note IS the lock screen, so it was
+  // already on the panel when the user picked the device up; a note never renders
+  // live and never interrupts, so waking is just a normal wake into whatever they
+  // were reading. MessageDisplayActivity survives only as an optional viewer.
+  // The Path B silent check is armed at the very end of setup(), and only on the
+  // branch that lands at the launcher.
 
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
@@ -420,14 +439,22 @@ void setup() {
         } else {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
-      } else if (!showLoveNote) {
+      } else {
         activityManager.goToBoot();  // frame file missing, fall back to the splash
       }
       break;
     case BootResume::Splash:
-      if (!showLoveNote) activityManager.goToBoot();
+      activityManager.goToBoot();
       break;
   }
+
+  // M2 #2 Path B gate: a note check may run ONLY when this boot lands at the
+  // launcher. This is a RAM constraint, not a UX nicety -- WiFi and an EPUB
+  // chapter build must never be resident at once on ~50 KB of free heap, so the
+  // resume-into-the-reader branches below must never arm one. Set per branch
+  // rather than inferred from the routing target, because there are two goHome
+  // and two goToReader sites here and only one goHome is a real wake.
+  bool landedAtLauncher = false;
 
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
@@ -443,11 +470,15 @@ void setup() {
     // target == home (or reader with no open book): land on home — don't fall
     // through to the sleep-wake "resume reader" logic, which fires on stale
     // openEpubPath + lastSleepFromReader from a prior session.
+    // landedAtLauncher stays false: a silent reboot is a heap-defrag restart on
+    // the way out of a WiFi activity, not a wake, and that activity just had the
+    // radio up. Nothing to check for.
     activityManager.goHome();
   } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
     // crashed (indicated by readerActivityLoadCount > 0)
+    landedAtLauncher = true;
     activityManager.goHome();
   } else {
     // Clear app state to avoid getting into a boot loop if the epub doesn't load
@@ -478,6 +509,17 @@ void setup() {
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
   allowSleepAt = millis() + 2000;
+
+  // M2 #2 Path B: arm the silent note check, last thing before loop() takes over.
+  // Deliberately after the go-back-to-sleep gates and the recovery-mode escape
+  // above -- both of those never reach here, so a re-sleeping wake never pays for
+  // a check and the UP+POWER bootloop escape is never delayed. Zero UI: the only
+  // observable effect is that the NEXT sleep-entry has a newer note to lock with.
+  // Nothing is fetched here; stepWakeCheck() in loop() does the work, and any
+  // activity transition cancels it with the radio down (ActivityManager).
+  if (landedAtLauncher) {
+    MessageSync::beginWakeCheck(display.getBufferSize());
+  }
 }
 
 void loop() {
@@ -517,7 +559,10 @@ void loop() {
   // Check for any user activity (button press or release) or active background work
   static unsigned long lastActivityTime = millis();
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity() || halTiltSensor.hadActivity() ||
-      activityManager.preventAutoSleep()) {
+      activityManager.preventAutoSleep() || MessageSync::wakeCheckActive()) {
+    // An armed Path B check counts as background work: it keeps the CPU off the
+    // idle downclock (the radio needs the full clock) and holds off auto-sleep for
+    // the at most 8 s the check can live, so a sleep can't land mid-transfer.
     lastActivityTime = millis();         // Reset inactivity timer
     powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
   }
@@ -580,6 +625,14 @@ void loop() {
   if (gpio.wasUsbStateChanged()) {
     activityManager.requestUpdate();
   }
+
+  // M2 #2 Path B: one non-blocking step of the armed note check. Placed after the
+  // sleep guards above so a sleep gesture always wins, and immediately before
+  // activityManager.loop() so that when an activity dispatches input into a
+  // transition (Home -> reader), the cancel inside replaceActivity() tears the
+  // radio down before the incoming activity's onEnter() ever runs. No-op unless a
+  // check is armed.
+  MessageSync::stepWakeCheck();
 
   const unsigned long activityStartTime = millis();
   activityManager.loop();
