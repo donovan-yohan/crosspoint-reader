@@ -48,11 +48,12 @@ std::string trimId(std::string s) {
   return s;
 }
 
-std::string readStagedId() {
-  char buf[MAX_ID_LEN + 1] = {};
-  const size_t n = Storage.readFileToBuffer(CURRENT_ID, buf, sizeof(buf));
-  if (n == 0) return std::string();
-  return trimId(std::string(buf));
+bool stagedFramePresent() {
+  HalFile file;
+  if (!Storage.openFileForRead("MSYNC", CURRENT_FRAME, file)) return false;
+  const bool present = file.size() > 0;
+  file.close();
+  return present;
 }
 
 // Radio setup shared by the blocking (Path A) and stepped (Path B) connects.
@@ -88,11 +89,13 @@ Probe probeLatest(const std::string& base, std::string& latestIdOut, uint32_t de
     LOG_DBG("MSYNC", "mailbox empty");
     return Probe::Empty;
   }
-  // The staged id is the ONLY dedup left, and it answers exactly one question:
-  // "do we already hold these bytes". Under the lock-screen model a note is not
-  // consumed by being looked at, so there is no persisted "last shown" id --
-  // which also means a note the user glanced at can still come back as the lock.
-  if (latestId == readStagedId()) {
+  // The staged id is the ONLY download dedup, and it answers exactly one
+  // question: "do we already hold these bytes". It is deliberately NOT
+  // APP_STATE.messageLastDisplayedId: that field decides whose turn it is on the
+  // panel (M2 #4), and wiring it in here would resurrect the round-1 defect where
+  // a note the user had already seen could never be re-fetched -- and, worse,
+  // where losing state.json would re-download every note ever staged.
+  if (latestId == MessageSync::stagedNoteId()) {
     LOG_DBG("MSYNC", "No new note (latest=%s)", latestId.c_str());
     return Probe::UpToDate;
   }
@@ -456,6 +459,38 @@ void MessageSync::cancelWakeCheck() {
 }
 
 bool MessageSync::wakeCheckActive() { return wake.step != WakeStep::Idle; }
+
+std::string MessageSync::stagedNoteId() {
+  char buf[MAX_ID_LEN + 1] = {};
+  const size_t n = Storage.readFileToBuffer(CURRENT_ID, buf, sizeof(buf));
+  if (n == 0) return std::string();
+  return trimId(std::string(buf));
+}
+
+bool MessageSync::noteAwaitingDisplay() {
+  if (!stagedFramePresent()) return false;
+  const std::string id = stagedNoteId();
+  // No sidecar: nothing to key the turn on, so this frame keeps the old
+  // unconditional precedence rather than silently never appearing. Only the
+  // phone app's frame-only diagnostic send produces this, and it documents
+  // exactly this behaviour.
+  if (id.empty()) return true;
+  return id != APP_STATE.messageLastDisplayedId;
+}
+
+void MessageSync::markStagedNoteDisplayed() {
+  const std::string id = stagedNoteId();
+  if (id.empty()) return;  // legacy/id-less frame: no turn to consume
+  if (APP_STATE.messageLastDisplayedId == id) return;
+  APP_STATE.messageLastDisplayedId = id;
+  // One SD write, and only on the sleeps where a note actually reached the
+  // panel -- not once per sleep and never on the wake path. Persisted here
+  // rather than at the next state save because deep sleep is the next thing that
+  // happens: an unsaved id would hand the same note a second turn after the
+  // wake, which is the exact behaviour this milestone removes.
+  APP_STATE.saveToFile();
+  LOG_DBG("MSYNC", "Note %s displayed; wallpaper resumes next sleep", id.c_str());
+}
 
 bool MessageSync::loadStagedNote(uint8_t* buffer, size_t bufferSize) {
   if (buffer == nullptr || bufferSize == 0) return false;

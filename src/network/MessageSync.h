@@ -4,14 +4,14 @@
 #include <functional>
 #include <string>
 
-// M2 #2 (messenger): note delivery -- the lock-screen model.
+// M2 #2 (messenger): note delivery -- the sleep-screen model.
 // See docs/xteink/mailbox-books-contract.md section 3A.
 //
-// THE NEWEST MAILBOX NOTE *IS* THE SLEEP/LOCK SCREEN. A note never renders live
-// and never interrupts: no banner, no toast, no press-to-view, no "unread"
-// state to dismiss. The user sets the book down, the panel paints, and the note
-// is what is on the panel. Picking the device back up is a normal wake into
-// whatever they were reading.
+// A NEW MAILBOX NOTE IS THE SLEEP SCREEN, ONCE. A note never renders live and
+// never interrupts: no banner, no toast, no press-to-view, no "unread" state to
+// dismiss. The user sets the book down, the panel paints, and the note is what is
+// on the panel. Picking the device back up is a normal wake into whatever they
+// were reading. Set it down again and the configured wallpaper is back.
 //
 // Two arrival paths, both terminating at the same place -- the frame staged at
 // /.love-notes/current.frame, which SleepActivity blits as the sleep image:
@@ -20,13 +20,17 @@
 //           same sleep-entry repaints the panel with it (A2 ordering; see
 //           enterDeepSleep() in main.cpp). Zero latency.
 //   Path B  published while asleep -> a silent, zero-UI check on the next
-//           *launcher* wake stages it; it becomes the lock at the next
+//           *launcher* wake stages it; it takes the panel at the next
 //           sleep-entry. One wake->sleep cycle of lag, deliberately accepted as
 //           the price of zero interruption.
 //
-// Reversion rule: the latest note stays the lock until a newer note replaces it.
-// No timer, no read-tracking, no revert-to-wallpaper -- wallpaper is the
-// no-note-exists fallback only.
+// Reversion rule (M2 #4, display-once): a note gets exactly ONE turn on the
+// panel. The first sleep after a note is staged paints it; every sleep and boot
+// after that paints the configured wallpaper again, until a newer note arrives.
+// The turn is keyed on the note id and consumed at the moment of the paint --
+// see noteAwaitingDisplay() / markStagedNoteDisplayed() below. The frame stays
+// staged either way, so MessageDisplayActivity can still re-open it on demand;
+// only the automatic sleep-image precedence is spent.
 //
 // The two UNATTENDED entry points -- syncBeforeSleep and beginWakeCheck -- are
 // gated on SETTINGS.messageSyncEnabled plus a non-empty SETTINGS.messageSyncUrl;
@@ -94,9 +98,10 @@ bool syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, const LinkUpHook
 // invariants"), so a pass killed by its deadline at any byte leaves the
 // previously staged current.frame bit-for-bit intact. Never touches the radio.
 //
-// A promoted note does NOT render here or anywhere near here: it becomes the
-// sleep screen at the next sleep-entry, unconditionally (3A). Callers report
-// "staged", they do not display.
+// A promoted note does NOT render here or anywhere near here: it takes the panel
+// at the next sleep-entry, for that one sleep (3A). Callers report "staged", they
+// do not display -- and staging deliberately does not touch the display-once id,
+// so a note staged by a pass that then died still gets its turn.
 enum class NoteResult : uint8_t {
   Failed,    // fetch failed, deadline hit, or the frame missed the exact-size gate
   NoNote,    // mailbox is empty
@@ -163,5 +168,32 @@ bool wakeCheckActive();
 // deletes the file, so a mismatch just falls back to the wallpaper. buffer must
 // be at least bufferSize bytes.
 bool loadStagedNote(uint8_t* buffer, size_t bufferSize);
+
+// The id sidecar of the staged note (/.love-notes/current.id), trimmed; empty
+// when there is no sidecar. This is the download-dedup key AND, since M2 #4, the
+// display-once key -- the same string, two independent consumers, deliberately
+// not the same persisted state.
+std::string stagedNoteId();
+
+// --- Display-once: whose turn is it? ---------------------------------------
+// True iff a frame is staged and its id has not already been painted as a sleep
+// image (APP_STATE.messageLastDisplayedId). This is the ONLY gate on the
+// automatic note-over-wallpaper precedence; both paint sites ask it:
+//
+//   SleepActivity::onEnter        the note staged before this sleep began
+//   enterDeepSleep's A2 repaint   the note this sleep's own sync just staged
+//
+// A staged frame with NO id sidecar keeps the old unconditional precedence: the
+// turn is keyed on the id, so there is nothing to consume, and the phone app's
+// frame-only diagnostic send documents itself as "displays on every sleep".
+// Every note the app or the mailbox actually delivers carries an id.
+bool noteAwaitingDisplay();
+
+// Consume the staged note's turn: record its id as displayed and persist. Call
+// IMMEDIATELY AFTER the panel refresh that painted it, never at staging time --
+// a note that was staged but never reached the panel (sync died after the
+// promote, or the sleep was a quick-resume) must still get its turn later.
+// No-ops -- and costs no SD write -- when there is nothing new to record.
+void markStagedNoteDisplayed();
 
 }  // namespace MessageSync

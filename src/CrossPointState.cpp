@@ -26,6 +26,7 @@ void CrossPointState::toJson(JsonDocument& doc) const {
   for (int i = 0; i < SLEEP_RECENT_COUNT; i++) recentArr.add(recentSleepImages[i]);
   doc["recentSleepPos"] = recentSleepPos;
   doc["recentSleepFill"] = recentSleepFill;
+  doc["messageLastDisplayedId"] = messageLastDisplayedId;
   doc["readerActivityLoadCount"] = readerActivityLoadCount;
   doc["lastSleepFromReader"] = lastSleepFromReader;
   doc["showBootScreen"] = showBootScreen;
@@ -48,6 +49,12 @@ bool CrossPointState::fromJson(JsonVariantConst doc) {
     const uint8_t legacy = doc["lastSleepImage"] | static_cast<uint8_t>(UINT8_MAX);
     if (legacy != UINT8_MAX) pushRecentSleep(static_cast<uint16_t>(legacy));
   }
+  // Absent on a state.json written by an older build: an empty id means "no note
+  // has been painted yet", so a note already staged across the upgrade gets one
+  // turn on the panel and then reverts to the wallpaper. That is the intended
+  // migration -- the alternative (seeding it from current.id) would silently eat
+  // the turn of a note the user has never seen.
+  messageLastDisplayedId = doc["messageLastDisplayedId"] | "";
   readerActivityLoadCount = doc["readerActivityLoadCount"] | static_cast<uint8_t>(0);
   lastSleepFromReader = doc["lastSleepFromReader"] | false;
   showBootScreen = doc["showBootScreen"] | true;

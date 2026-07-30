@@ -266,13 +266,22 @@ void enterDeepSleep(bool fromTimeout = false) {
     // snapshotted the pre-sync panel, so a repaint here would leave sleep_frame.bin
     // (and, on the X3, the differential-refresh baseline restored from it at wake)
     // desynced from what is physically on the panel. A quick-resume sleep means
-    // "put the screen back exactly as it was", so the note stays staged and locks
-    // the next normal sleep instead. SleepActivity::onEnter enforces the same rule
-    // on the selection side.
-    if (stagedNewNote && !isQuickResumeSleep) {
+    // "put the screen back exactly as it was", so the note keeps its unspent turn
+    // and takes the next normal sleep instead. SleepActivity::onEnter enforces the
+    // same rule on the selection side.
+    //
+    // M2 #4: this is the second of the two paint sites, and it asks the SAME
+    // display-once question SleepActivity just asked, for the same reason -- a
+    // note gets exactly one turn, keyed on its id. stagedNewNote alone would be
+    // very nearly right (the note this sync promoted is new by construction), but
+    // routing both sites through noteAwaitingDisplay() is what makes "one turn"
+    // a property of the id rather than of two call sites agreeing. The id is
+    // recorded after the refresh, so this note reverts to wallpaper next sleep.
+    if (stagedNewNote && !isQuickResumeSleep && MessageSync::noteAwaitingDisplay()) {
       RenderLock lock;
       if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
         renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+        MessageSync::markStagedNoteDisplayed();
       }
     }
 
@@ -381,12 +390,20 @@ void setup() {
   APP_STATE.loadFromFile();
 
   // M2 #2 (messenger, contract section 3A): there is deliberately NO wake-time
-  // note interrupt here any more. The newest note IS the lock screen, so it was
-  // already on the panel when the user picked the device up; a note never renders
-  // live and never interrupts, so waking is just a normal wake into whatever they
-  // were reading. MessageDisplayActivity survives only as an optional viewer.
+  // note interrupt here any more. A staged note was already on the panel when the
+  // user picked the device up; a note never renders live and never interrupts, so
+  // waking is just a normal wake into whatever they were reading.
+  // MessageDisplayActivity survives only as an optional viewer.
   // The Path B silent check is armed at the very end of setup(), and only on the
   // branch that lands at the launcher.
+  //
+  // M2 #4: boot paints no sleep/lock image at all -- the two boot presentations
+  // are the splash (BootActivity) and the quick-resume restore of
+  // /.crosspoint/sleep_frame.bin below, neither of which consults the mailbox.
+  // The note's turn is therefore decided in exactly one place, at sleep-entry,
+  // and it is display-once because APP_STATE.messageLastDisplayedId -- loaded on
+  // the line above -- survives the boot. A device that boots holding a note it
+  // has already shown paints the configured wallpaper at its next sleep.
 
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));

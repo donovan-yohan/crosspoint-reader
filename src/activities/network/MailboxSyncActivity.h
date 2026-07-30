@@ -22,10 +22,12 @@
 //
 // WHAT THE USER SEES, AND WHAT THEY DELIBERATELY DO NOT. Books land in /books and
 // are readable the moment the mode exits, because a book is a file in a library.
-// A note does NOT render here: the lock-screen model (contract 3A) is
-// unconditional, so a note staged during a sync becomes the sleep screen at the
-// next sleep-entry and the progress screen only says that it did. Rendering it
-// inline would reintroduce exactly the interrupting-note model 3A deleted.
+// A note does NOT render here: contract 3A routes every note through the sleep
+// screen, so a note staged during a sync takes its one turn on the panel at the
+// next sleep-entry (SleepActivity, keyed on the note id) and the progress screen
+// only says that it will. Rendering it inline would reintroduce exactly the
+// interrupting-note model 3A deleted. Nothing in this activity touches
+// APP_STATE.messageLastDisplayedId -- staging is not displaying.
 //
 // REPAINT ON STATE CHANGE, NEVER PER POLL. There is no partial-refresh path
 // exposed to activities (GfxRenderer::displayWindow is commented out), so every

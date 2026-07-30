@@ -39,13 +39,13 @@ void SleepActivity::onEnter() {
     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
   }
 
-  // M2 #2 (messenger, contract section 3A): the newest staged note IS the lock
-  // screen, so this sits ahead of EVERY wallpaper mode -- a note must lock the
-  // screen for a user on DARK or COVER too, not just CUSTOM. Wallpaper is the
-  // no-note-exists fallback only, and the note stays the lock until a newer note
-  // replaces it (no timer, no read-tracking, no revert). Quick-resume sleeps
-  // returned above and are deliberately left alone: "put the screen back exactly
-  // as it was" wins, and the note becomes the lock at the next normal sleep.
+  // M2 #2/#4 (messenger, contract section 3A): a newly staged note takes the
+  // panel for ONE sleep, ahead of EVERY wallpaper mode -- a note must show for a
+  // user on DARK or COVER too, not just CUSTOM. It is display-once: the paint
+  // below records the note's id, so the next sleep (and the next boot -- the id
+  // is persisted) falls straight through to the configured wallpaper. Quick-resume
+  // sleeps returned above and are deliberately left alone: "put the screen back
+  // exactly as it was" wins, and the note's turn survives to the next normal sleep.
   if (renderNoteSleepScreen()) return;
 
   switch (SETTINGS.sleepScreen) {
@@ -71,14 +71,26 @@ void SleepActivity::onEnter() {
 // this costs no second ~51 KB allocation, and a size mismatch just falls through
 // to the wallpaper without deleting anything.
 //
+// M2 #4: noteAwaitingDisplay() is asked FIRST and answers "is it this note's
+// turn", so an already-displayed note costs one tiny sidecar read rather than a
+// 48-52 KB frame read on every single sleep. The file is never deleted -- only
+// the automatic precedence is consumed -- so MessageDisplayActivity can still
+// re-open the note on demand.
+//
+// markStagedNoteDisplayed() is called AFTER displayBuffer() returns, i.e. after
+// the panel has physically taken the frame. Recording the id before the paint
+// would burn the turn of a note that a brown-out ate mid-refresh.
+//
 // HALF, not FULL: every sleep screen in this file paints with a single HALF
 // refresh because the OEM firmware's only clean refresh in normal operation is
 // the single-pass 0xD7 sequence. MessageDisplayActivity uses FULL_REFRESH because
 // it is a foreground activity; the lock screen must not.
 bool SleepActivity::renderNoteSleepScreen() const {
+  if (!MessageSync::noteAwaitingDisplay()) return false;
   if (!MessageSync::loadStagedNote(renderer.getFrameBuffer(), renderer.getBufferSize())) return false;
-  LOG_DBG("SLP", "Sleep screen: staged mailbox note");
+  LOG_DBG("SLP", "Sleep screen: staged mailbox note (its one turn)");
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  MessageSync::markStagedNoteDisplayed();
   return true;
 }
 

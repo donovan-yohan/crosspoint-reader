@@ -451,8 +451,9 @@ void MailboxSyncActivity::runPollCycle() {
   if (state == State::Stalled) state = State::Polling;
 
   if (note == MessageSync::NoteResult::Staged) {
-    // Staged, NOT shown. The lock-screen model is unconditional: this frame becomes
-    // the sleep screen at the next sleep-entry. The screen reports it; it does not
+    // Staged, NOT shown -- and staging deliberately does not consume the note's
+    // display turn (M2 #4): this frame gets the panel at the next sleep-entry,
+    // once, and then the wallpaper comes back. The screen reports it; it does not
     // render it, and it must not -- MessageDisplayActivity paints a FULL_REFRESH
     // multi-flash waveform and would reintroduce the interrupting note.
     notesStaged++;
