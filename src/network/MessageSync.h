@@ -28,9 +28,11 @@
 // panel. The first sleep after a note is staged paints it; every sleep and boot
 // after that paints the configured wallpaper again, until a newer note arrives.
 // The turn is keyed on the note id and consumed at the moment of the paint --
-// see noteAwaitingDisplay() / markStagedNoteDisplayed() below. The frame stays
-// staged either way, so MessageDisplayActivity can still re-open it on demand;
-// only the automatic sleep-image precedence is spent.
+// see noteAwaitingDisplay() / markStagedNoteDisplayed() below. The frame is not
+// deleted either way -- only the automatic sleep-image precedence is spent -- so
+// an optional on-demand viewer can be (re)introduced without touching delivery.
+// MessageDisplayActivity is that viewer, and it is currently UNREACHABLE:
+// ActivityManager::goToMessage() has no callers.
 //
 // The two UNATTENDED entry points -- syncBeforeSleep and beginWakeCheck -- are
 // gated on SETTINGS.messageSyncEnabled plus a non-empty SETTINGS.messageSyncUrl;
@@ -183,17 +185,22 @@ std::string stagedNoteId();
 //   SleepActivity::onEnter        the note staged before this sleep began
 //   enterDeepSleep's A2 repaint   the note this sleep's own sync just staged
 //
-// A staged frame with NO id sidecar keeps the old unconditional precedence: the
-// turn is keyed on the id, so there is nothing to consume, and the phone app's
-// frame-only diagnostic send documents itself as "displays on every sleep".
-// Every note the app or the mailbox actually delivers carries an id.
+// A staged frame with NO id sidecar is treated as UNSEEN and gets a turn -- it
+// is not exempt from display-once. Every writer clears current.id before staging
+// a frame, so an empty sidecar means "not keyed yet", never "already painted",
+// and markStagedNoteDisplayed() mints a local key at the paint so the turn is
+// spent like any other. That matters because an id-less frame is not just the
+// app's frame-only diagnostic send: a sidecar upload that fails after the frame
+// landed is a documented, non-fatal outcome of a normal direct send.
 bool noteAwaitingDisplay();
 
 // Consume the staged note's turn: record its id as displayed and persist. Call
 // IMMEDIATELY AFTER the panel refresh that painted it, never at staging time --
 // a note that was staged but never reached the panel (sync died after the
 // promote, or the sleep was a quick-resume) must still get its turn later.
-// No-ops -- and costs no SD write -- when there is nothing new to record.
+// No-ops -- and costs no SD write -- when there is nothing new to record. The
+// one case that DOES write more than state.json is a frame with no id sidecar:
+// a local key is minted into current.id here so its turn can be consumed.
 void markStagedNoteDisplayed();
 
 }  // namespace MessageSync

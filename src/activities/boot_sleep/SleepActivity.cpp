@@ -74,8 +74,9 @@ void SleepActivity::onEnter() {
 // M2 #4: noteAwaitingDisplay() is asked FIRST and answers "is it this note's
 // turn", so an already-displayed note costs one tiny sidecar read rather than a
 // 48-52 KB frame read on every single sleep. The file is never deleted -- only
-// the automatic precedence is consumed -- so MessageDisplayActivity can still
-// re-open the note on demand.
+// the automatic precedence is consumed -- so an optional on-demand viewer
+// (MessageDisplayActivity, currently unreachable) can be re-introduced without
+// touching delivery.
 //
 // markStagedNoteDisplayed() is called AFTER displayBuffer() returns, i.e. after
 // the panel has physically taken the frame. Recording the id before the paint

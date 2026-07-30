@@ -141,7 +141,18 @@ bool promoteIncoming(const std::string& latestId, size_t frameBufferSize) {
     Storage.remove(INCOMING_FRAME);
     return false;
   }
-  Storage.writeFile(CURRENT_ID, String(latestId.c_str()));
+  if (!Storage.writeFile(CURRENT_ID, String(latestId.c_str()))) {
+    // The rename already landed, so current.frame IS the new note while
+    // current.id still names the PREVIOUS one -- and that pairing is silently
+    // fatal under display-once: noteAwaitingDisplay() would compare the stale id
+    // against messageLastDisplayedId, find them equal, and skip the note at BOTH
+    // paint sites, while the mailbox re-fetched its 52 KB every window
+    // (latestId != stagedNoteId()). Drop the sidecar instead: an id-less frame
+    // reads as unseen, so the note still gets its turn and mints a key when it
+    // is painted. The frame is genuinely staged either way -- still true.
+    LOG_ERR("MSYNC", "id sidecar write failed for %s; dropping stale id", latestId.c_str());
+    Storage.remove(CURRENT_ID);
+  }
   LOG_INF("MSYNC", "Staged note %s", latestId.c_str());
   return true;
 }
@@ -470,17 +481,42 @@ std::string MessageSync::stagedNoteId() {
 bool MessageSync::noteAwaitingDisplay() {
   if (!stagedFramePresent()) return false;
   const std::string id = stagedNoteId();
-  // No sidecar: nothing to key the turn on, so this frame keeps the old
-  // unconditional precedence rather than silently never appearing. Only the
-  // phone app's frame-only diagnostic send produces this, and it documents
-  // exactly this behaviour.
+  // No sidecar: an UNSEEN frame by construction, so it gets a turn. Every writer
+  // clears current.id before staging a frame -- the app's direct send deletes it
+  // as step 1 of every send, and promoteIncoming() drops it rather than leave a
+  // stale one -- so an empty sidecar can only mean "these bytes have not been
+  // keyed yet", never "these bytes were already painted". The turn is not
+  // open-ended: markStagedNoteDisplayed() mints the key at paint time.
   if (id.empty()) return true;
   return id != APP_STATE.messageLastDisplayedId;
 }
 
 void MessageSync::markStagedNoteDisplayed() {
-  const std::string id = stagedNoteId();
-  if (id.empty()) return;  // legacy/id-less frame: no turn to consume
+  std::string id = stagedNoteId();
+  if (id.empty()) {
+    // An id-less frame is a real, deliverable note: the app uploads the 52 KB
+    // frame and only then the sidecar, and a sidecar upload that fails after a
+    // successful frame is a documented, non-fatal outcome on a flaky WS link
+    // (SendLoveNoteFrameResult.idStaged:false / idError). Exempting it from
+    // display-once would hand it the panel on EVERY sleep forever with no way
+    // for the user to clear it -- exactly the behaviour this milestone removes.
+    // So mint a local key HERE, at the paint, and stage it as the sidecar.
+    //
+    // Safe on both consumers: a genuinely new id-less frame still earns a fresh
+    // turn, because every writer clears current.id before it stages a frame; and
+    // download dedup is untouched, because a mailbox latestId can never equal
+    // this marker (the frame is re-fetchable exactly as it was without a sidecar).
+    char minted[32];
+    snprintf(minted, sizeof(minted), "local-%lu", static_cast<unsigned long>(millis()));
+    if (!Storage.writeFile(CURRENT_ID, String(minted))) {
+      // SD write failed: leave the frame unkeyed rather than record an id that
+      // is not on the card. It keeps its turn and is re-keyed at the next paint.
+      LOG_ERR("MSYNC", "could not mint a local id for the staged note");
+      return;
+    }
+    id = minted;
+    LOG_DBG("MSYNC", "Staged note had no id sidecar; minted %s", minted);
+  }
   if (APP_STATE.messageLastDisplayedId == id) return;
   APP_STATE.messageLastDisplayedId = id;
   // One SD write, and only on the sleeps where a note actually reached the
