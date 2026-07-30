@@ -28,8 +28,14 @@
 // No timer, no read-tracking, no revert-to-wallpaper -- wallpaper is the
 // no-note-exists fallback only.
 //
-// Everything here is gated on SETTINGS.messageSyncEnabled plus a non-empty
-// SETTINGS.messageSyncUrl; there are no other user-facing settings.
+// The two UNATTENDED entry points -- syncBeforeSleep and beginWakeCheck -- are
+// gated on SETTINGS.messageSyncEnabled plus a non-empty SETTINGS.messageSyncUrl;
+// there are no other user-facing settings for them. The reusable primitives below
+// (connectSavedNetwork / syncOnLink / radioOff) are deliberately UNGATED: they run
+// on a link and a base their caller chose, so the policy decision -- "may this
+// radio come up right now, and against which origin" -- belongs to that caller. A
+// user-initiated sync mode is its own policy and must not be forced through the
+// unattended notes switch.
 namespace MessageSync {
 
 // --- Path A: sleep-entry sync (blocking, bounded) --------------------------
@@ -64,6 +70,69 @@ namespace MessageSync {
 // returns, whatever the hook did.
 using LinkUpHook = std::function<void(const std::string& base, bool stagedNewNote)>;
 bool syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, const LinkUpHook& whileLinkUp = nullptr);
+
+// --- Reusable: one note pass on a link somebody else owns -------------------
+// The same shape BookSync::syncOnLink already has (BookSync.h:48), for the same
+// reason: syncBeforeSleep owns the radio end to end -- it connects and guarantees
+// WiFi is off when it returns -- which is the opposite of what a live-sync poll
+// loop needs. This is the pass without those bookends, and syncBeforeSleep is now
+// a thin composition of connect + this + hook + teardown.
+//
+// `base` is the mailbox base URL with no trailing slash, and it is a PARAMETER,
+// never read from SETTINGS in here. That is the whole structural requirement the
+// peer-proxy transport places on this surface (contract appendix A4: "build it
+// with the base URL as a parameter", A3: the peer base is http://{peerIp}:{port}
+// plus the path of the configured one). Base-URL selection is the only difference
+// between the two transports.
+//
+// `deadline` is an absolute millis() timestamp bounding the WHOLE pass -- both
+// HTTP calls -- and 0 means unbounded, which no caller should want: these are
+// BLOCKING calls, so the deadline is the only thing that keeps a base that
+// answers the association but not the request from holding the calling task.
+//
+// Stages through incoming -> validate -> promote (contract 3A "Staging
+// invariants"), so a pass killed by its deadline at any byte leaves the
+// previously staged current.frame bit-for-bit intact. Never touches the radio.
+//
+// A promoted note does NOT render here or anywhere near here: it becomes the
+// sleep screen at the next sleep-entry, unconditionally (3A). Callers report
+// "staged", they do not display.
+enum class NoteResult : uint8_t {
+  Failed,    // fetch failed, deadline hit, or the frame missed the exact-size gate
+  NoNote,    // mailbox is empty
+  UpToDate,  // newest note is the one already staged
+  Staged,    // a NEW frame is at current.frame; it shows at the next sleep-entry
+};
+NoteResult syncOnLink(const std::string& base, size_t frameBufferSize, uint32_t deadline);
+
+// Wall-clock budget for one note pass, measured from the moment the association
+// is up: one tiny latest.txt GET plus, at most, one frame (52272 B on the X3) at
+// the contract's 30 KB/s pessimistic floor = ~1.8 s, so 10 s is a handshake plus
+// ~4x slack. Capped rather than "whatever is left of the window" so a mailbox
+// that associates but does not answer cannot spend the books budget too.
+constexpr uint32_t NOTE_PASS_BUDGET_MS = 10000;
+
+// --- Reusable: the radio, for callers that own it ---------------------------
+// Hard fail-fast budget for the whole connect phase; unreachable networks bail
+// sooner on WL_CONNECT_FAILED / WL_NO_SSID_AVAIL.
+constexpr uint32_t CONNECT_BUDGET_MS = 6000;
+
+// Connect to a saved network, last-connected SSID first, within a hard overall
+// deadline. Returns true iff associated. Leaves the radio UP on success -- the
+// caller owns it from there and must call radioOff() on every exit path,
+// including errors.
+bool connectSavedNetwork(uint32_t budgetMs = CONNECT_BUDGET_MS);
+
+// The one WiFi teardown recipe for this module's STA paths. Exposed so a caller
+// that owns the radio tears it down exactly the way the sleep-entry path does
+// rather than open-coding a variant that leaves the modem powered.
+void radioOff();
+
+// SETTINGS.messageSyncUrl with trailing slashes stripped; empty when unset. The
+// configured mailbox base -- the base for the internet transport, and the string
+// the peer transport takes the path portion of (contract section 6: one
+// capability URL, one budget, no second settings field).
+std::string configuredBase();
 
 // --- Path B: wake-side check (stepped, zero UI) -----------------------------
 // Arm one bounded check. Call from setup() ONLY on the branch that lands at the
