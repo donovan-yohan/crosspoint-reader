@@ -299,7 +299,7 @@ int wakeConnectStep() {
 }
 }  // namespace
 
-bool MessageSync::syncBeforeSleep(size_t frameBufferSize) {
+bool MessageSync::syncBeforeSleep(size_t frameBufferSize, const LinkUpHook& whileLinkUp) {
   if (!SETTINGS.messageSyncEnabled) return false;
   const std::string base = baseUrl();
   if (base.empty()) return false;
@@ -309,23 +309,30 @@ bool MessageSync::syncBeforeSleep(size_t frameBufferSize) {
     return false;
   }
 
+  // The note half runs to completion first, unconditionally: it is tiny and
+  // latency-sensitive, and it must never queue behind a book.
+  bool staged = false;
   std::string latestId;
-  if (probeLatest(base, latestId) != Probe::NewNote) {
-    wifiOff();
-    return false;
+  if (probeLatest(base, latestId) == Probe::NewNote) {
+    LOG_INF("MSYNC", "New note %s: downloading frame", latestId.c_str());
+    const HttpDownloader::DownloadError err = downloadIncoming(base);
+    if (err != HttpDownloader::OK) {
+      LOG_ERR("MSYNC", "frame download failed (%d)", static_cast<int>(err));
+      Storage.remove(INCOMING_FRAME);
+    } else {
+      // Promoted while the radio is still up. That is pure SD work either way,
+      // and doing it here rather than after the teardown is what lets the hook
+      // see the final "a new note is staged" answer.
+      staged = promoteIncoming(latestId, frameBufferSize);
+    }
   }
 
-  LOG_INF("MSYNC", "New note %s: downloading frame", latestId.c_str());
-  const HttpDownloader::DownloadError err = downloadIncoming(base);
-  wifiOff();  // WiFi no longer needed regardless of outcome
+  // Everything else that needs this window happens here, on the link the connect
+  // above already paid for. Bounded by the hook itself -- see BookSync::syncOnLink.
+  if (whileLinkUp) whileLinkUp(base, staged);
 
-  if (err != HttpDownloader::OK) {
-    LOG_ERR("MSYNC", "frame download failed (%d)", static_cast<int>(err));
-    Storage.remove(INCOMING_FRAME);
-    return false;
-  }
-
-  return promoteIncoming(latestId, frameBufferSize);
+  wifiOff();  // no longer needed, regardless of either half's outcome
+  return staged;
 }
 
 void MessageSync::beginWakeCheck(size_t frameBufferSize) {

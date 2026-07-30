@@ -18,6 +18,7 @@
 #include <builtinFonts/all.h>
 
 #include <cstring>
+#include <string>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -32,6 +33,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
+#include "network/BookSync.h"
 #include "network/MessageSync.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
@@ -171,6 +173,16 @@ void waitForPowerRelease() {
 
 constexpr char SLEEP_FRAME_FILE[] = "/.crosspoint/sleep_frame.bin";
 
+// Hard cap on the whole sleep-entry sync: connect + notes + the A2 repaint +
+// the books window. The contract's own headline number -- ~8 s of fixed cost
+// (<= 6 s connect plus a TLS handshake) plus BookSync::WINDOW_BUDGET_MS of
+// transfer -- and it is a wall-clock bound enforced inside the body read loops,
+// not a hope based on the 60 s per-socket-op timeout. The panel already shows
+// the sleep screen for all of it, so the device looks asleep throughout; that is
+// exactly why the number must stay small enough that a POWER press landing
+// inside the window is a rare annoyance rather than the normal experience.
+constexpr uint32_t SLEEP_SYNC_WINDOW_MS = 8000 + BookSync::WINDOW_BUDGET_MS;
+
 static void saveSleepFrameBuffer() {
   HalFile file;
   if (!Storage.openFileForWrite("SLP", SLEEP_FRAME_FILE, file)) return;
@@ -221,30 +233,47 @@ void enterDeepSleep(bool fromTimeout = false) {
   // enter here. Deep sleep fully resets the chip, so the post-WiFi fragmented
   // heap is discarded on the next wake -- no silentRestart needed. syncBeforeSleep
   // leaves WiFi off; the teardown below is a safety net.
-  const bool stagedNewNote = MessageSync::syncBeforeSleep(display.getBufferSize());
-
-  // M2 #2 Path A2 (contract section 3A): goToSleep() above painted the sleep
-  // screen BEFORE the sync, so a note that just landed is staged but is not on
-  // the panel yet. Repaint it exactly once, and only on the sleeps where a note
-  // actually arrived: the user walking away sees the wallpaper resolve into the
-  // note. Cost is one extra ~1.7 s HALF refresh, no radio. Keeping this ordering
-  // (paint, sync, repaint) rather than syncing first is deliberate -- syncing
-  // first would leave the last reading frame on the panel for the whole bounded
-  // WiFi window, so the device would look awake-but-frozen instead of asleep.
   //
-  // Never on a quick-resume sleep: saveSleepFrameBuffer() above already
-  // snapshotted the pre-sync panel, so a repaint here would leave sleep_frame.bin
-  // (and, on the X3, the differential-refresh baseline restored from it at wake)
-  // desynced from what is physically on the panel. A quick-resume sleep means
-  // "put the screen back exactly as it was", so the note stays staged and locks
-  // the next normal sleep instead. SleepActivity::onEnter enforces the same rule
-  // on the selection side.
-  if (stagedNewNote && !isQuickResumeSleep) {
-    RenderLock lock;
-    if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  // M2 #3 (books, contract section 3): the books window rides the SAME
+  // association, inside the hook, so the <= 6 s connect budget and the TLS
+  // handshake are paid once for both halves. The whole window -- connect, notes,
+  // the A2 repaint and books -- is capped at SLEEP_SYNC_WINDOW_MS from here.
+  const uint32_t sleepSyncDeadline = millis() + SLEEP_SYNC_WINDOW_MS;
+  MessageSync::syncBeforeSleep(display.getBufferSize(), [&](const std::string& base, const bool stagedNewNote) {
+    // M2 #2 Path A2 (contract section 3A): goToSleep() above painted the sleep
+    // screen BEFORE the sync, so a note that just landed is staged but is not on
+    // the panel yet. Repaint it exactly once, and only on the sleeps where a note
+    // actually arrived: the user walking away sees the wallpaper resolve into the
+    // note. Cost is one extra ~1.7 s HALF refresh, no radio. Keeping this ordering
+    // (paint, sync, repaint) rather than syncing first is deliberate -- syncing
+    // first would leave the last reading frame on the panel for the whole bounded
+    // WiFi window, so the device would look awake-but-frozen instead of asleep.
+    //
+    // The repaint runs BEFORE the books window, not after it: a note is a
+    // 52 KB frame the user is waiting to see, a book window is up to 20 s of
+    // transfer. Books-first would hold a just-arrived note off the panel for the
+    // whole download, for no gain -- the radio stays associated across the
+    // ~1.7 s refresh either way.
+    //
+    // Never on a quick-resume sleep: saveSleepFrameBuffer() above already
+    // snapshotted the pre-sync panel, so a repaint here would leave sleep_frame.bin
+    // (and, on the X3, the differential-refresh baseline restored from it at wake)
+    // desynced from what is physically on the panel. A quick-resume sleep means
+    // "put the screen back exactly as it was", so the note stays staged and locks
+    // the next normal sleep instead. SleepActivity::onEnter enforces the same rule
+    // on the selection side.
+    if (stagedNewNote && !isQuickResumeSleep) {
+      RenderLock lock;
+      if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
+        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+      }
     }
-  }
+
+    // Whatever is left of the window goes to books: at most one book, resumed
+    // across windows, promoted only on an exact size match. Returns early when
+    // too little budget survives the note phase to be worth a handshake.
+    BookSync::syncOnLink(base, sleepSyncDeadline);
+  });
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.

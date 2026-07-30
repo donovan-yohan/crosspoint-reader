@@ -1,6 +1,8 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <string>
 
 // M2 #2 (messenger): note delivery -- the lock-screen model.
 // See docs/xteink/mailbox-books-contract.md section 3A.
@@ -40,7 +42,20 @@ namespace MessageSync {
 //
 // Returns true iff this call promoted a NEW frame -- the signal enterDeepSleep()
 // uses to decide whether the already-painted sleep screen needs one repaint.
-bool syncBeforeSleep(size_t frameBufferSize);
+//
+// `whileLinkUp`, if set, is invoked once with the mailbox base URL and that same
+// "a new note was staged" flag, AFTER the note phase is completely finished and
+// BEFORE the radio is torn down. It exists so the books window (M2 #3) can ride
+// the association the note phase already paid the <= 6 s connect budget and the
+// TLS handshake for, instead of opening a second connect path. It runs on every
+// outcome of the note phase except a failed connect -- an empty mailbox or an
+// up-to-date note still leaves a perfectly good link to use.
+//
+// MessageSync knows nothing about what the hook does; it only guarantees the
+// ordering (notes first, always) and that WiFi is off when syncBeforeSleep
+// returns, whatever the hook did.
+using LinkUpHook = std::function<void(const std::string& base, bool stagedNewNote)>;
+bool syncBeforeSleep(size_t frameBufferSize, const LinkUpHook& whileLinkUp = nullptr);
 
 // --- Path B: wake-side check (stepped, zero UI) -----------------------------
 // Arm one bounded check. Call from setup() ONLY on the branch that lands at the
