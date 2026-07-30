@@ -37,6 +37,20 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   // The structural throttle, one check per launcher wake, stands alone. Old keys in
   // state.json are simply ignored by fromJson.
   std::string messageLastDisplayedId;
+  // Contract appendix A3: the passphrase of the reader's own "Sync with app" AP.
+  //
+  // PER DEVICE, NOT PER SESSION. The phone app saves this once, under "Reader AP
+  // password", and every later session joins with the saved value -- so the
+  // passphrase MUST survive reboots or the save-once pairing model is dead and the
+  // user retypes a fresh 10 characters off the panel every single sync.
+  //
+  // Minted lazily on the FIRST AP session (MailboxSyncActivity::devicePsk), never
+  // at boot: a device whose owner only ever syncs over a saved network never
+  // generates one, and the mint needs the radio powered for the hardware RNG.
+  //
+  // Empty here means "not minted yet", which is also the recovery path: clear this
+  // key in state.json and the next AP session mints a new one.
+  std::string mailboxApPsk;
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;
   bool showBootScreen = true;

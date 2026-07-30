@@ -123,7 +123,7 @@ class MailboxSyncActivity final : public Activity {
   std::string configuredUrl;
   std::string base;         // Empty until the link is up and the base is composed.
   std::string apSsid;       // AP transport only, shown on the panel.
-  std::string apPsk;        // AP transport only, shown on the panel. Session-scoped.
+  std::string apPsk;        // Shown on the panel. Per DEVICE: APP_STATE.mailboxApPsk.
   std::string targetName;   // Book currently being received, for the Receiving state.
   size_t targetBytes = 0;   // ...and its size, so the panel can show "1.2 / 4.0 MB".
   size_t targetHave = 0;

@@ -27,6 +27,7 @@ void CrossPointState::toJson(JsonDocument& doc) const {
   doc["recentSleepPos"] = recentSleepPos;
   doc["recentSleepFill"] = recentSleepFill;
   doc["messageLastDisplayedId"] = messageLastDisplayedId;
+  doc["mailboxApPsk"] = mailboxApPsk;
   doc["readerActivityLoadCount"] = readerActivityLoadCount;
   doc["lastSleepFromReader"] = lastSleepFromReader;
   doc["showBootScreen"] = showBootScreen;
@@ -55,6 +56,11 @@ bool CrossPointState::fromJson(JsonVariantConst doc) {
   // migration -- the alternative (seeding it from current.id) would silently eat
   // the turn of a note the user has never seen.
   messageLastDisplayedId = doc["messageLastDisplayedId"] | "";
+  // Absent on a state.json written by an older build, and absent on any device
+  // that has never raised the "Sync with app" AP -- both mean "mint one at the
+  // first AP session". Validity (WPA2 length bounds) is checked at the use site,
+  // which is where the softAP rules actually live.
+  mailboxApPsk = doc["mailboxApPsk"] | "";
   readerActivityLoadCount = doc["readerActivityLoadCount"] | static_cast<uint8_t>(0);
   lastSleepFromReader = doc["lastSleepFromReader"] | false;
   showBootScreen = doc["showBootScreen"] | true;

@@ -8,6 +8,7 @@
 
 #include <cstdio>
 
+#include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "SilentRestart.h"
 #include "components/UITheme.h"
@@ -33,7 +34,7 @@ constexpr uint8_t AP_CHANNEL = 1;
 // The whole candidate space PeerProbe sweeps is derived from this: four leases.
 constexpr uint8_t AP_MAX_CONNECTIONS = 4;
 
-// PER-DEVICE, PER-SESSION AP PASSPHRASE -- appendix A3's second required fix.
+// PER-DEVICE AP PASSPHRASE -- appendix A3's second required fix.
 //
 // The shipped transfer-mode AP is open (AP_PASSWORD is a compile-time nullptr),
 // and A3 is explicit that an open AP is not good enough here even with the
@@ -43,22 +44,43 @@ constexpr uint8_t AP_MAX_CONNECTIONS = 4;
 // from that same station. A PSK is what stops an uninvited station occupying a
 // lease at all.
 //
-// It is generated fresh per session rather than provisioned once, and that is the
-// stronger choice available to a FOREGROUND mode: the user is looking at the panel
-// and joins with what is printed on it, so there is nothing to store, nothing to
-// leak from storage, and nothing an attacker can precompute. A passphrase derived
-// from the MAC would be strictly worse than useless -- the AP's BSSID is in every
-// beacon, so anyone in range could compute it.
+// MINTED ONCE PER DEVICE, THEN REUSED FOREVER, and that is a bug fix rather than a
+// preference: the first cut generated a fresh passphrase on every activity entry,
+// which invalidated the app's saved "Reader AP password" on every single session.
+// The phone would refuse to auto-join a network whose PSK had silently changed and
+// the user had to retype the panel every sync -- the save-once pairing model the
+// app is built around, dead. The AP is a stable piece of this device's identity, so
+// the passphrase has to be too.
 //
-// Generated AFTER WiFi.mode(WIFI_AP) has powered the radio: esp_fill_random is a
-// true hardware RNG only while WiFi or BT is enabled, and a PSK from the
-// pseudo-random fallback would defeat the point.
-constexpr size_t PSK_LEN = 12;  // 12 chars over a 32-symbol alphabet = 60 bits.
+// NOT DERIVED FROM THE MAC, which is the obvious way to get stability for free and
+// is worse than useless: the AP's BSSID is in every beacon, so a MAC-derived
+// passphrase is computable by anyone in radio range (PeerProbe.h says the same).
+// Random once, stored once, is the only shape that is both stable and unguessable.
+//
+// STORED IN APP_STATE (state.json on the SD card). The threat this defends against
+// is a station squatting a DHCP lease on a 30-minute foreground AP; someone holding
+// the card in their hand has the books, the notes and the mailbox URL already, so
+// storage plaintext is not the weak link. It rides the same store as
+// messageLastDisplayedId and gets the same one-write-when-it-changes treatment.
+//
+// Minted AFTER WiFi.mode(WIFI_AP) has powered the radio: esp_fill_random is a true
+// hardware RNG only while WiFi or BT is enabled, and a PSK from the pseudo-random
+// fallback would defeat the point. That is why devicePsk() is called from inside
+// startPhoneApLink() and not at boot -- and it also means a device whose owner only
+// ever syncs over a saved network never mints one at all.
+constexpr size_t PSK_LEN = 10;  // 10 chars over a 32-symbol alphabet = 50 bits.
 // Unambiguous alphabet: no 0/O, no 1/I/L, so a passphrase read off e-ink and typed
 // into a phone cannot fail on a glyph. 32 symbols exactly, so the rejection-free
 // mask below is uniform.
 constexpr char PSK_ALPHABET[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ#";
 static_assert(sizeof(PSK_ALPHABET) - 1 == 32, "PSK alphabet must be exactly 32 symbols for a uniform 5-bit draw");
+// WPA2 passphrase bounds. PSK_LEN sits inside them by construction; these exist to
+// judge a value read back off the card, which a user can hand-edit and a truncated
+// write can corrupt. A too-short PSK would make softAP() fail outright, so a stored
+// value that is out of bounds is treated as "not minted" rather than trusted.
+constexpr size_t PSK_MIN_LEN = 8;
+constexpr size_t PSK_MAX_LEN = 63;
+static_assert(PSK_LEN >= PSK_MIN_LEN && PSK_LEN <= PSK_MAX_LEN, "generated PSK must be a legal WPA2 passphrase");
 
 std::string generatePsk() {
   uint8_t raw[PSK_LEN];
@@ -67,6 +89,34 @@ std::string generatePsk() {
   psk.reserve(PSK_LEN);
   for (const uint8_t b : raw) psk.push_back(PSK_ALPHABET[b & 0x1F]);
   return psk;
+}
+
+// The device's AP passphrase: the stored one if there is a usable one, otherwise a
+// freshly minted one, persisted before it is ever shown so the value on the panel
+// and the value on the card can never disagree.
+//
+// There is no in-UI "regenerate" yet, deliberately: the join panel's spare button
+// slots are cheap but the label is not -- a new user-visible string is a key, a
+// generator run and 31 translation files -- and the reset path (clear mailboxApPsk
+// in state.json) covers the only case anyone has actually needed. Worth adding the
+// moment a second string on this screen has to be translated anyway.
+//
+// The save is the only SD write this mode adds, and it happens on exactly one
+// session in the life of the device. If it fails, the passphrase is still used for
+// THIS session -- a sync the user is standing in front of is worth more than the
+// pairing convenience -- and the next session simply mints again.
+std::string devicePsk() {
+  const std::string& stored = APP_STATE.mailboxApPsk;
+  if (stored.size() >= PSK_MIN_LEN && stored.size() <= PSK_MAX_LEN) return stored;
+
+  const std::string minted = generatePsk();
+  APP_STATE.mailboxApPsk = minted;
+  if (!APP_STATE.saveToFile()) {
+    LOG_ERR("MSYNCUI", "could not persist the AP passphrase; the app will have to be re-paired next session");
+  } else {
+    LOG_INF("MSYNCUI", "Minted this device's AP passphrase");
+  }
+  return minted;
 }
 
 constexpr int QR_SIZE = 180;
@@ -293,7 +343,7 @@ bool MailboxSyncActivity::startPhoneApLink() {
   //      range needs no name resolution, and the server costs heap in the
   //      tightest place in the system.
   //   3. no mDNS            -- same argument.
-  //   4. a real PSK         -- see generatePsk().
+  //   4. a real PSK         -- see devicePsk().
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
 
@@ -315,7 +365,9 @@ bool MailboxSyncActivity::startPhoneApLink() {
   delay(100);
 
   apSsid = AP_SSID;
-  apPsk = generatePsk();  // after mode(): the RNG needs the radio powered
+  // Stable across sessions -- the app pairs once. Called from here, after mode(),
+  // because a first-ever mint needs the radio powered for the hardware RNG.
+  apPsk = devicePsk();
 
   if (!WiFi.softAP(apSsid.c_str(), apPsk.c_str(), AP_CHANNEL, false, AP_MAX_CONNECTIONS)) {
     LOG_ERR("MSYNCUI", "softAP failed to start");
