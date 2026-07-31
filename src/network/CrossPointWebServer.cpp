@@ -1823,6 +1823,19 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
           if (!filePath.endsWith("/")) filePath += "/";
           filePath += wsUploadFileName;
 
+          // Same two refusals as the HTTP handler, on the same open AP: no
+          // traversal, and nothing writes into the device's own configuration
+          // directory. This path already refuses collisions, so /.crosspoint's
+          // existing files were safe -- but "cannot be replaced" is not the same
+          // as "cannot be planted", and neither app sender nor the browser UI
+          // has ever had a reason to write there.
+          if (wsUploadFileName.isEmpty() || wsUploadFileName.indexOf('/') >= 0 || hasTraversal(wsUploadFileName) ||
+              hasTraversal(wsUploadPath) || isProtectedTarget(filePath)) {
+            LOG_DBG("WS", "Upload rejected: %s", filePath.c_str());
+            wsServer->sendTXT(num, "ERROR:Invalid upload path");
+            return;
+          }
+
           resetTaskWatchdogIfSubscribed();
           if (Storage.exists(filePath.c_str())) {
             LOG_DBG("WS", "Upload collision: %s", filePath.c_str());
