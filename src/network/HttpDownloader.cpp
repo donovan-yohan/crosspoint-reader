@@ -68,6 +68,26 @@ bool isRedirect(int status) {
   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
+// Scheme + authority of a URL, with the path dropped: "https://host:port".
+//
+// THE PATH IS A SECRET ON THIS DEVICE. A mailbox URL is
+// https://host/m/{boxId}/... and the boxId is the bearer capability for every
+// note and every book (contract section 2: reads are unauthenticated, protected
+// by the unguessable path). ERR is compiled into every shipping build, the
+// status<0 branch below fires on any ordinary transport failure, every logged
+// line lands in the RTC_NOINIT ring, and HalSystem dumps that ring verbatim into
+// /crash_report.txt -- a file the device's own UI asks the user to attach to a
+// bug report and which GET /download serves to anyone on the open transfer-mode
+// AP. So the failing-fetch log gets the authority only; the full URL stays at
+// DBG, which release builds compile out. Same authority-vs-path split as
+// PeerProbe::pathOf and MailboxSyncActivity::originOf.
+std::string authorityOf(const std::string& url) {
+  const size_t schemeEnd = url.find("://");
+  const size_t authorityStart = (schemeEnd == std::string::npos) ? 0 : schemeEnd + 3;
+  const size_t slash = url.find('/', authorityStart);
+  return slash == std::string::npos ? url : url.substr(0, slash);
+}
+
 bool sinkExpired(const Sink& sink) {
   if (sink.cancelFlag && *sink.cancelFlag) return true;
   return sink.deadlineMs != 0 && static_cast<int32_t>(millis() - sink.deadlineMs) >= 0;
@@ -120,7 +140,7 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
     http.setTimeout(socketTimeoutFor(sink));
     http.setInsecure();
     if (!http.begin(url)) {
-      LOG_ERR("HTTP", "wolfSSL bad URL: %s", url.c_str());
+      LOG_ERR("HTTP", "wolfSSL bad URL at %s", authorityOf(url).c_str());
       return HttpDownloader::HTTP_ERROR;
     }
     // setUserAgent replaces SecureHttpClient's built-in UA; addHeader would
@@ -189,7 +209,7 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
 
     if (http.aborted()) return HttpDownloader::ABORTED;
     if (status < 0) {
-      LOG_ERR("HTTP", "wolfSSL request failed: %s", url.c_str());
+      LOG_ERR("HTTP", "wolfSSL request failed at %s", authorityOf(url).c_str());
       return HttpDownloader::HTTP_ERROR;
     }
     if (isRedirect(status)) {
@@ -417,7 +437,7 @@ bool HttpDownloader::deleteUrl(const std::string& url, const uint32_t deadlineMs
   http.setTimeout(socketTimeoutFor(sink));
   http.setInsecure();
   if (!http.begin(url)) {
-    LOG_ERR("HTTP", "wolfSSL bad URL: %s", url.c_str());
+    LOG_ERR("HTTP", "wolfSSL bad URL at %s", authorityOf(url).c_str());
     return false;
   }
   http.setUserAgent("CrossPoint-ESP32-" CROSSPOINT_VERSION);
