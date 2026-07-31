@@ -335,6 +335,16 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                                  v.size() > CrossPointState::MAILBOX_AP_PSK_MAX_LEN)) {
                 return false;  // a PSK outside WPA2's bounds cannot raise the AP at all
               }
+              // WPA2 passphrases are PRINTABLE ASCII, and the same rule already
+              // judges a passphrase arriving from a foreign peer
+              // (MailboxSyncActivity::parseWifiPayload). Without it the two
+              // surfaces disagree: a value pasted into the web settings API could
+              // hold control bytes or UTF-8, which softAP refuses far from here
+              // and which cannot be drawn on the panel or typed off it.
+              for (const char c : v) {
+                const auto b = static_cast<unsigned char>(c);
+                if (b < 0x20 || b > 0x7E) return false;
+              }
               if (v == APP_STATE.mailboxApPsk) return true;
               const std::string previous = APP_STATE.mailboxApPsk;
               APP_STATE.mailboxApPsk = v;

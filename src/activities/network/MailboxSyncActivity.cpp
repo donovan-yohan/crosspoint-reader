@@ -187,6 +187,19 @@ std::string originOf(const std::string& url) {
   return slash == std::string::npos ? url : url.substr(0, slash);
 }
 
+// Backslash-escape the characters the zxing WIFI: format gives meaning to, so a
+// value carrying one cannot end its field early. Applied to the SSID and the
+// passphrase in the join QR.
+std::string escapeQrField(const std::string& value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const char c : value) {
+    if (c == '\\' || c == ';' || c == ',' || c == ':' || c == '"') out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
+}
+
 // One trailing CR, so the app may end its lines CRLF or LF.
 std::string_view stripCr(std::string_view line) {
   if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
@@ -761,15 +774,34 @@ void MailboxSyncActivity::tryWifiHandoff() {
     refuse("the saved networks could not be read");
     return;
   }
-  if (!WIFI_STORE.addCredential(ssid, password)) {
+  // ADD-NEW-ONLY. addCredential() OVERWRITES the stored password of an SSID it
+  // already knows, and the thing on the other end of this link has proved
+  // nothing beyond answering /cp-proxy with the string "cp-proxy". A station
+  // that returns the user's real home SSID with a wrong passphrase would
+  // silently destroy the credential every unattended sync depends on, with no
+  // user-visible symptom and no way to tell what happened. A handover is
+  // therefore allowed to ADD a network and never to replace one.
+  //
+  // Re-offering a network the reader already holds is the normal case (the app
+  // keeps offering until it sees an ack), so an identical credential is a
+  // success, not a refusal -- it acks and stops the offers.
+  if (const WifiCredential* existing = WIFI_STORE.findCredential(ssid)) {
+    if (existing->password != password) {
+      refuse("that network is already saved with a different password");
+      return;
+    }
+  } else if (!WIFI_STORE.addCredential(ssid, password)) {
     // The eight-network store is full, or the card write failed. NO ACK: the
     // credential stays staged on the phone, and a session with room takes it.
     refuse("the credential could not be saved");
     return;
   }
-  // The user just told us this is the network they are standing in, which makes it
-  // the right first candidate for the next unattended sync.
-  WIFI_STORE.setLastConnectedSsid(ssid);
+  // DELIBERATELY NOT setLastConnectedSsid(): that field is the FIRST network
+  // every unattended sleep-entry and wake check tries, for the rest of the
+  // device's life, and this credential arrived from a station that authenticated
+  // nothing. It is in the saved list either way, so the reader still finds it --
+  // it just does not get to jump ahead of the network the user picked by hand on
+  // the WiFi screen, which is the only thing that writes that field.
   // The SSID is in every beacon this reader can hear, so naming it costs nothing.
   // THE PASSWORD IS NEVER LOGGED, at any level, redacted or otherwise -- it is the
   // one secret this whole feature exists to move, and a log is a file on a card
@@ -964,7 +996,14 @@ void MailboxSyncActivity::renderPhoneJoinPanel(const int top) const {
   // WPA join QR, per the zxing WIFI: convention the transfer-mode screen already
   // uses -- the phone's camera fills in both fields, so the passphrase below is the
   // fallback for when it does not, not the primary path.
-  const std::string wifiConfig = std::string("WIFI:T:WPA;S:") + apSsid + ";P:" + apPsk + ";;";
+  //
+  // Both fields are ESCAPED. The minted passphrase never needs it (its alphabet
+  // is alphanumerics plus '#'), but the passphrase is user-settable from two
+  // editors now, and a ';' or a '\' typed into either one would otherwise end the
+  // field early: the phone would join with a silently truncated passphrase and
+  // fail, with the panel showing the correct one.
+  const std::string wifiConfig = std::string("WIFI:T:WPA;S:") + escapeQrField(apSsid) + ";P:" + escapeQrField(apPsk) +
+                                 ";;";
   const Rect qrBounds((pageWidth - QR_SIZE) / 2, y, QR_SIZE, QR_SIZE);
   QrUtils::drawQrCode(renderer, qrBounds, wifiConfig);
   y += QR_SIZE + metrics.verticalSpacing;
@@ -972,7 +1011,11 @@ void MailboxSyncActivity::renderPhoneJoinPanel(const int top) const {
   renderer.drawCenteredText(UI_10_FONT_ID, y, apSsid.c_str(), true, EpdFontFamily::BOLD);
   y += lineHeight;
 
-  char pskLine[64];
-  snprintf(pskLine, sizeof(pskLine), "%s: %s", tr(STR_SYNC_PASSWORD_LABEL), apPsk.c_str());
-  renderer.drawCenteredText(UI_10_FONT_ID, y, pskLine);
+  // Sized for what this field is allowed to hold, not for the minted 10 chars:
+  // MAILBOX_AP_PSK_MAX_LEN is 63, and the label is a translated string. A
+  // truncated line here would show the user a passphrase that cannot work.
+  std::string pskLine = tr(STR_SYNC_PASSWORD_LABEL);
+  pskLine += ": ";
+  pskLine += apPsk;
+  renderer.drawCenteredText(UI_10_FONT_ID, y, pskLine.c_str());
 }
