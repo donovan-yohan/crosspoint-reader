@@ -467,7 +467,7 @@ bool HttpDownloader::deleteUrl(const std::string& url, const uint32_t deadlineMs
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, bool* cancelFlag,
                                                              const std::string& username, const std::string& password,
-                                                             uint32_t deadlineMs) {
+                                                             uint32_t deadlineMs, size_t maxBytes) {
   LOG_DBG("HTTP", "Downloading: %s -> %s", url.c_str(), destPath.c_str());
 
   if (Storage.exists(destPath.c_str())) {
@@ -483,7 +483,19 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   sink.progress = std::move(progress);
   sink.cancelFlag = cancelFlag;
   sink.deadlineMs = deadlineMs;
-  sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
+  size_t written = 0;
+  bool overLimit = false;
+  sink.write = [&file, &written, &overLimit, maxBytes](const uint8_t* data, const size_t len) {
+    if (maxBytes != 0 && written + len > maxBytes) {
+      // Refused before the write, so not one byte over the cap reaches the card.
+      // Returning false stops the transfer; the caller removes destPath below.
+      overLimit = true;
+      return false;
+    }
+    if (file.write(data, len) != len) return false;
+    written += len;
+    return true;
+  };
 
   const DownloadError result = runGetSecure(url, username, password, sink);
   // Close before any remove() on the same path; DESTRUCTOR_CLOSES_FILE would
@@ -491,6 +503,9 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   file.close();
 
   if (result != OK) {
+    if (overLimit) {
+      LOG_ERR("HTTP", "body over the %zu byte cap; aborted", maxBytes);
+    }
     Storage.remove(destPath.c_str());
     return result;
   }

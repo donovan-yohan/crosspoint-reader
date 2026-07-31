@@ -85,11 +85,17 @@ class HttpDownloader {
    * the 60 s per-socket-op timeout as a bound. Independent of `cancelFlag`: a
    * caller that cannot poll (one blocking call on the input task) needs the
    * deadline, a caller with a UI loop wants both.
+   *
+   * `maxBytes` (0 = no cap) aborts the transfer the moment the body would exceed
+   * it, and destPath is removed like any other failure. For a caller that knows
+   * the only legal size up front -- a note frame IS the panel buffer size -- that
+   * is a far tighter bound than the deadline: without it a server answering with
+   * a stream gets to write to the SD card for the whole window.
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr,
                                       const std::string& username = "", const std::string& password = "",
-                                      uint32_t deadlineMs = 0);
+                                      uint32_t deadlineMs = 0, size_t maxBytes = 0);
 
   struct RangeResult {
     DownloadError error = HTTP_ERROR;

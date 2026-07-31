@@ -30,6 +30,13 @@ constexpr char SUFFIX_FRAME[] = "/current.frame";
 
 constexpr uint32_t STATUS_POLL_MS = 100;
 constexpr size_t MAX_ID_LEN = 128;
+// Largest latest.txt body the reader will read off the wire. Comfortably above
+// MAX_ID_LEN (the trim is still what decides the id) so a contract-shaped answer
+// with trailing whitespace or a CRLF is never rejected, and small enough that a
+// hostile or misconfigured origin cannot make this the allocation that kills a
+// sleep entry. See probeLatest.
+constexpr size_t MAX_ID_BYTES = 256;
+static_assert(MAX_ID_BYTES > MAX_ID_LEN, "the wire cap must not be tighter than the id it carries");
 
 // Absolute deadline `budget` ms from now, never past `cap` (an absolute deadline,
 // 0 = uncapped).
@@ -80,8 +87,31 @@ enum class Probe : uint8_t { Failed, Empty, UpToDate, NewNote };
 // keeps a mailbox that associates-but-does-not-answer from holding that task.
 Probe probeLatest(const std::string& base, std::string& latestIdOut, uint32_t deadline) {
   std::string latestId;
-  if (!HttpDownloader::fetchUrl(base + SUFFIX_ID, latestId, "", "", deadline)) {
-    LOG_DBG("MSYNC", "latest-id fetch failed");
+  bool overflowed = false;
+  // THE BOUNDED-BODY OVERLOAD, not the std::string one, for exactly the reason
+  // PeerProbe::isProxy and tryWifiHandoff already use it: fetchUrl(std::string&)
+  // appends every chunk with no ceiling and the MAX_ID_LEN trim happens only
+  // after the whole body is resident. This runs unattended on EVERY sleep entry
+  // and on the Path B wake check, against an origin that is web-editable, may be
+  // a station on the reader's own AP, or may be a captive portal that answers the
+  // GET with a page. A megabyte of std::string growth on the ~50 KB of free heap
+  // a reading session leaves is an allocation failure, and this build is
+  // -fno-exceptions: that is an abort at sleep entry, repeating on every sleep for
+  // as long as the device sits on that network. Returning false from the sink
+  // aborts the transfer instead.
+  const bool ok = HttpDownloader::fetchUrl(
+      base + SUFFIX_ID,
+      [&latestId, &overflowed](const uint8_t* data, const size_t len) {
+        if (latestId.size() + len > MAX_ID_BYTES) {
+          overflowed = true;
+          return false;
+        }
+        latestId.append(reinterpret_cast<const char*>(data), len);
+        return true;
+      },
+      "", "", deadline);
+  if (!ok) {
+    LOG_DBG("MSYNC", "latest-id fetch failed%s", overflowed ? " (body too large to be a note id)" : "");
     return Probe::Failed;
   }
   latestId = trimId(std::move(latestId));
@@ -107,11 +137,17 @@ Probe probeLatest(const std::string& base, std::string& latestIdOut, uint32_t de
 // millis() bound (0 = none) -- see probeLatest: blocking call, and the file is
 // removed by the caller on any non-OK result, so a deadline hit mid-body simply
 // re-fetches next window rather than leaving a torn frame staged.
-HttpDownloader::DownloadError downloadIncoming(const std::string& base, uint32_t deadline) {
+HttpDownloader::DownloadError downloadIncoming(const std::string& base, uint32_t deadline, size_t frameBufferSize) {
   // openFileForWrite uses O_CREAT only (no parent-dir creation); a fresh device
   // that never received an M1 web upload has no /.love-notes yet, so ensure it.
   Storage.ensureDirectoryExists(NOTES_DIR);
-  return HttpDownloader::downloadToFile(base + SUFFIX_FRAME, INCOMING_FRAME, nullptr, nullptr, "", "", deadline);
+  // The EXACT legal size is known before the first byte -- the frame is the live
+  // panel buffer or it is not a frame -- so the transfer is capped at it rather
+  // than left to the deadline. Without the cap an origin answering with a stream
+  // writes to the SD card for the whole budget and the bytes are only rejected
+  // afterwards by the size gate in promoteIncoming.
+  return HttpDownloader::downloadToFile(base + SUFFIX_FRAME, INCOMING_FRAME, nullptr, nullptr, "", "", deadline,
+                                        frameBufferSize);
 }
 
 // Validate the staged bytes and promote them. Pure SD work -- callers turn WiFi
@@ -135,6 +171,16 @@ bool promoteIncoming(const std::string& latestId, size_t frameBufferSize) {
   // Promote: replace current.frame, then record its id sidecar. The sidecar
   // write must stay AFTER a successful rename -- an id recorded for a frame that
   // isn't there marks the note fetched and it is never retried.
+  //
+  // THE OLD SIDECAR GOES FIRST, before the frame it describes stops existing.
+  // noteAwaitingDisplay() leans on "an id next to a frame always names THAT
+  // frame"; between the rename and the writeFile below that invariant was
+  // carried by nothing but the two lines running back to back, and a power loss
+  // or a failed write in that gap left the PREVIOUS note's id sitting next to
+  // the new frame -- which reads as "already displayed" and silently costs the
+  // new note its one turn on the panel. An id-less frame is the documented safe
+  // state (it reads as unseen), so clearing first can only fail safe.
+  Storage.remove(CURRENT_ID);
   Storage.remove(CURRENT_FRAME);
   if (!Storage.rename(INCOMING_FRAME, CURRENT_FRAME)) {
     LOG_ERR("MSYNC", "promote rename failed");
@@ -338,7 +384,7 @@ MessageSync::NoteResult MessageSync::syncOnLink(const std::string& base, size_t 
   }
 
   LOG_INF("MSYNC", "New note %s: downloading frame", latestId.c_str());
-  const HttpDownloader::DownloadError err = downloadIncoming(base, deadline);
+  const HttpDownloader::DownloadError err = downloadIncoming(base, deadline, frameBufferSize);
   if (err != HttpDownloader::OK) {
     LOG_ERR("MSYNC", "frame download failed (%d)", static_cast<int>(err));
     Storage.remove(INCOMING_FRAME);
@@ -491,7 +537,7 @@ void MessageSync::stepWakeCheck() {
 
     case WakeStep::Download: {
       LOG_INF("MSYNC", "Wake check: new note %s, downloading frame", wake.latestId.c_str());
-      const HttpDownloader::DownloadError err = downloadIncoming(wake.base, wake.phaseDeadline);
+      const HttpDownloader::DownloadError err = downloadIncoming(wake.base, wake.phaseDeadline, wake.frameSize);
       // Radio off before the SD promote and before control returns to the
       // launcher: WiFi and a chapter build must never be resident at once.
       MessageSync::radioOff();
