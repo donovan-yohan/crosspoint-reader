@@ -349,6 +349,13 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
               return true;
             },
             "mailboxApPsk", StrId::STR_CAT_SYSTEM, CrossPointState::MAILBOX_AP_PSK_MAX_LEN)
+            // The AP passphrase is the single control appendix A3's threat model
+            // leans on, and GET /api/settings answers anyone on an OPEN AP. It is
+            // masked there (SETTINGS_MASKED_VALUE); the on-device editor, which
+            // needs no protection from someone already holding the reader, still
+            // shows it. Storage is unaffected -- this entry is a DynamicString
+            // over APP_STATE, so CrossPointSettings' obfuscated-save loop skips it.
+            .withObfuscated()
             .withInvalidHint(StrId::STR_MAILBOX_AP_PASSPHRASE_RULE),
         SettingInfo::Value(
             StrId::STR_TIME_TO_SLEEP, &CrossPointSettings::sleepTimeoutMinutes,
@@ -369,6 +376,22 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             sizeof(SETTINGS.opdsDownloadFolder), "opdsDownloadFolder"),
         // Message-sync mailbox base URL: persisted + web-exposed, category-less
         // so it stays off the on-device Settings screen (edited via web UI).
+        //
+        // NOT withObfuscated(), and that is a KNOWN, DELIBERATE residual rather
+        // than an oversight. This string is a capability URL -- its /m/{boxId}
+        // path is the only thing protecting every note and every book in the
+        // mailbox (contract section 2), the user cannot rotate it from the
+        // device, and GET /api/settings answers it to anyone in range while
+        // transfer mode's OPEN AP is up. It belongs behind the same mask as the
+        // two secrets above.
+        //
+        // What stops that today is the provisioning handshake on the other side:
+        // the app WRITES this key and then reads it back and compares it for
+        // equality (send-to-x4-mobile-app services/reader_provision.ts, "reads
+        // back as ..."), so a masked GET would make every provisioning attempt
+        // report failure. Masking it is therefore a lockstep firmware+app change:
+        // add .withObfuscated() here and teach the app's read-back to accept the
+        // mask as "set" in the same release.
         SettingInfo::String(StrId::STR_MESSAGE_SYNC_URL, &SETTINGS.messageSyncUrl[0], sizeof(SETTINGS.messageSyncUrl),
                             "messageSyncUrl"),
         // OPDS download filename format: persisted + web-exposed, category-less so it
@@ -396,7 +419,10 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
               KOREADER_STORE.saveToFile();
               return true;
             },
-            "koPassword", StrId::STR_KOREADER_SYNC),
+            // Masked in the web API for the same reason as the two above; the
+            // store keeps its own obfuscation on disk, which this does not touch.
+            "koPassword", StrId::STR_KOREADER_SYNC)
+            .withObfuscated(),
         SettingInfo::DynamicString(
             StrId::STR_SYNC_SERVER_URL, [] { return KOREADER_STORE.getServerUrl(); },
             [](const std::string& v) {

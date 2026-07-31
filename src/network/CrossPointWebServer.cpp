@@ -1337,10 +1337,23 @@ void CrossPointWebServer::handleGetSettings() const {
       }
       case SettingType::STRING: {
         doc["type"] = "string";
+        std::string value;
         if (s.stringGetter) {
-          doc["value"] = s.stringGetter();
+          value = s.stringGetter();
         } else if (s.stringMaxLen > 0) {
-          doc["value"] = reinterpret_cast<const char*>(&SETTINGS) + s.stringOffset;
+          value = reinterpret_cast<const char*>(&SETTINGS) + s.stringOffset;
+        }
+        // Secrets are never emitted. The API is unauthenticated and transfer
+        // mode's AP is open, so anything sent here is readable by anyone in
+        // range -- and for messageSyncUrl that means permanent, unrevokable read
+        // access to the whole mailbox. An UNSET secret stays empty so the page
+        // does not show a mask over nothing; a set one becomes the sentinel the
+        // POST handler refuses to write back.
+        if (s.obfuscated) {
+          doc["masked"] = true;
+          doc["value"] = value.empty() ? "" : SETTINGS_MASKED_VALUE;
+        } else {
+          doc["value"] = value;
         }
         break;
       }
@@ -1440,6 +1453,13 @@ void CrossPointWebServer::handlePostSettings() {
       }
       case SettingType::STRING: {
         const std::string val = doc[s.key].as<std::string>();
+        // The client is holding the mask GET sent it, not a new value: leave the
+        // stored secret alone. Counted as applied so a page that round-trips the
+        // whole document still reads as a clean save.
+        if (s.obfuscated && val == SETTINGS_MASKED_VALUE) {
+          applied++;
+          break;
+        }
         if (s.stringSetter) {
           if (!s.stringSetter(val)) {
             if (rejected.length() > 0) rejected += ", ";

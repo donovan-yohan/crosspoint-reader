@@ -12,6 +12,22 @@
 
 enum class SettingType { TOGGLE, ENUM, ACTION, VALUE, STRING };
 
+// What GET /api/settings sends instead of the value of a secret-bearing string
+// entry, and what POST /api/settings reads as "the client is holding the mask,
+// leave the stored value alone".
+//
+// The web API has no authentication and transfer mode raises an OPEN AP, so
+// every string it emits is readable by anyone in radio range. Most settings are
+// preferences; three are not. mailboxApPsk is the passphrase for the sync AP,
+// messageSyncUrl is a bearer capability the user cannot rotate from the device
+// (possession of it is possession of every note and every book), and koPassword
+// is an account password. Those are marked withObfuscated() and masked here.
+//
+// A sentinel rather than an empty string on purpose: this POST handler applies
+// every key PRESENT in the body, and a browser that round-trips the whole
+// document would otherwise CLEAR the secret it was never shown.
+constexpr char SETTINGS_MASKED_VALUE[] = "••••••••";
+
 enum class SettingAction {
   None,
   RemapFrontButtons,
