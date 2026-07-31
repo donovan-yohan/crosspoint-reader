@@ -257,6 +257,12 @@ constexpr uint32_t WAKE_CONNECT_BUDGET_MS = 8000;
 // A deadline hit mid-frame costs nothing but the radio time: the bytes went to
 // INCOMING_FRAME, so the note is simply re-fetched on the next wake or staged by
 // the sleep-entry sync.
+//
+// CAVEAT, and it is the reason MessageSync.h no longer calls these the worst
+// case: on https neither budget reaches the wolfSSL handshake, which caps itself
+// at ~15 s per method attempt with nothing polling the deadline inside it. A host
+// that accepts the TCP connection and then stalls adds that much on top of these
+// numbers, on the task that dispatches input.
 constexpr uint32_t WAKE_PROBE_BUDGET_MS = 3000;
 constexpr uint32_t WAKE_FRAME_BUDGET_MS = 5000;
 
@@ -429,7 +435,15 @@ const char* noteResultName(const MessageSync::NoteResult r) {
 //   - it is at most one line per sleep.
 bool MessageSync::syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, const LinkUpHook& whileLinkUp) {
   if (!SETTINGS.messageSyncEnabled) {
-    LOG_INF("MSYNC", "Sleep sync OFF: 'Message sync' is disabled in Settings > System");
+    // DBG, unlike the refusals below, and that is an upstream-preservation
+    // decision: the feature ships OFF, so for every user who never enables it
+    // this line -- and only this line -- would fire on EVERY deep-sleep entry,
+    // for ever. The RTC_NOINIT ring holds 16 lines and is the device's whole
+    // post-mortem trail, so an unconditional INF here spends a sixteenth of the
+    // crash evidence of a user who does not have this feature, to say that they
+    // do not have this feature. The other two refusals mean "you switched it on
+    // and it still cannot run", which is a diagnosis worth a release-build line.
+    LOG_DBG("MSYNC", "Sleep sync OFF: 'Message sync' is disabled in Settings > System");
     return false;
   }
   const std::string base = configuredBase();
@@ -471,7 +485,7 @@ bool MessageSync::syncBeforeSleep(size_t frameBufferSize, uint32_t deadline, con
 void MessageSync::beginWakeCheck(size_t frameBufferSize) {
   if (wake.step != WakeStep::Idle) return;
   if (!SETTINGS.messageSyncEnabled) {
-    LOG_INF("MSYNC", "Wake check OFF: 'Message sync' is disabled in Settings > System");
+    LOG_DBG("MSYNC", "Wake check OFF: 'Message sync' is disabled in Settings > System");  // see syncBeforeSleep
     return;
   }
   std::string base = configuredBase();

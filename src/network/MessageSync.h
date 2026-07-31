@@ -155,9 +155,19 @@ void beginWakeCheck(size_t frameBufferSize);
 
 // One step of the armed check; call once per main-loop iteration. The <= 6 s
 // connect budget is polled rather than blocked on. The two HTTP steps DO block the
-// calling task, but each is bounded by its own phase budget (3 s probe, 5 s frame),
-// so that is the worst-case input latency they can add. No-op when nothing is
-// armed.
+// calling task, each bounded by its own phase budget (3 s probe, 5 s frame).
+//
+// THOSE BUDGETS ARE NOT THE WHOLE WORST CASE ON https, and this used to claim
+// they were. HttpDownloader's deadline reaches the header/body reads and the
+// plain-http TCP connect, but NOT the wolfSSL handshake: SecureClient caps that
+// internally at ~15 s per method attempt and nothing polls the deadline inside it
+// (see the socketTimeoutFor comment in HttpDownloader.cpp). So a host that accepts
+// the TCP connection and then stalls the handshake -- lossy 2.4 GHz, a half-open
+// connection, a black-holed backhaul -- can freeze the launcher's input, POWER
+// included, for that long on a wake. Bounding it properly needs an abortable
+// connect in the SDK's TLS client; until then this is the honest number.
+//
+// No-op when nothing is armed.
 void stepWakeCheck();
 
 // Abandon an armed check and tear WiFi down immediately. Mandatory before any

@@ -138,6 +138,12 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
     if (sinkExpired(sink)) return HttpDownloader::ABORTED;
     freeink::SecureHttpClient http;
     http.setTimeout(socketTimeoutFor(sink));
+    // NO CERTIFICATE VERIFICATION -- inherited, load-bearing, and documented as a
+    // residual in HttpDownloader.h. wolfSSL here has no CA bundle wired up
+    // (SecureClient offers a single pinned PEM root), so every https fetch on a
+    // shipping build, including the mailbox capability URL, is MITM-able on a
+    // hostile network. Do not read the runGet() comment below as describing this
+    // path: that branch is dead on every env in platformio.ini.
     http.setInsecure();
     if (!http.begin(url)) {
       LOG_ERR("HTTP", "wolfSSL bad URL at %s", authorityOf(url).c_str());
@@ -261,12 +267,14 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   // Clamped to the caller's remaining window for the same reason as the wolfSSL
   // path: open() is not abortable, so the socket timeout is its only bound.
   config.timeout_ms = static_cast<int>(socketTimeoutFor(sink));
-  // Verify HTTPS against the bundled CA roots. This build has esp-tls
-  // CONFIG_ESP_TLS_INSECURE off, so an unverified TLS handshake can't be set
-  // up at all; the model is public servers over verified https and local
-  // servers over plain http (esp_http_client picks the transport from the URL
-  // scheme, so http:// needs no cert config). The prior setInsecure() worked
-  // only because Arduino's ssl_client drives mbedtls directly.
+  // Verify HTTPS against the bundled CA roots. NOTE: this whole function is dead
+  // code on every shipping env (they all define FREEINK_NET_WOLFSSL and dispatch
+  // to runGetWolf, which does NOT verify), so this is the verification story of a
+  // build nobody ships -- see the residual documented in HttpDownloader.h.
+  // Where it does apply: esp-tls CONFIG_ESP_TLS_INSECURE is off, so an unverified
+  // TLS handshake cannot be set up at all; the model is public servers over
+  // verified https and local servers over plain http (esp_http_client picks the
+  // transport from the URL scheme, so http:// needs no cert config).
   config.crt_bundle_attach = esp_crt_bundle_attach;
   config.keep_alive_enable = true;
 

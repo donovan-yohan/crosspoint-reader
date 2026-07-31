@@ -6,9 +6,26 @@
 #include <string>
 
 /**
- * HTTP client utility for fetching content and downloading files. Built on
- * esp_http_client: https is verified against the CA bundle, plain http is
- * used for local servers (transport is chosen from the URL scheme).
+ * HTTP client utility for fetching content and downloading files. The transport
+ * is chosen from the URL scheme; plain http is used for local servers.
+ *
+ * HTTPS IS NOT CERTIFICATE-VERIFIED ON ANY SHIPPING BUILD. Every env in
+ * platformio.ini defines FREEINK_NET_WOLFSSL, so requests go through
+ * SecureHttpClient with setInsecure() -- the verified esp_http_client/CA-bundle
+ * path below it is dead code on those builds (SecureClient supports a single
+ * pinned PEM root via setCACert, not a bundle). This header used to claim CA
+ * verification outright, which was true only of the path nothing builds.
+ *
+ * WHAT THAT COSTS, so a caller can decide: an active MITM on any joined network
+ * -- an evil twin of a saved SSID, a hostile hotspot, a captive portal -- sees
+ * the full request URL and can substitute the response body. For OPDS that is a
+ * public catalogue. For the mailbox the URL carries the boxId capability (read
+ * access to every note and every book, unrevokable from the device) and the body
+ * becomes a sleep-screen frame or an installed book, gated only by a size match
+ * against a manifest fetched over the same channel. Fixing it properly means
+ * shipping roots in flash or pinning the mailbox origin's issuer; until then this
+ * is a known, documented residual rather than an assumption anyone should build
+ * on.
  */
 class HttpDownloader {
  public:
