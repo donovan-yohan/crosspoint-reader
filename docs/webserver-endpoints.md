@@ -112,6 +112,7 @@ Query parameters:
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `path` | No | `/` | Destination directory |
+| `overwrite` | No | off | `1` replaces an existing file of the same name |
 
 Successful response:
 
@@ -121,7 +122,14 @@ File uploaded successfully: mybook.epub
 
 Notes:
 
-- Existing files with the same name are overwritten.
+- An existing file of the same name is REFUSED (`400 File already exists: ...`)
+  unless `overwrite=1` is passed. This matches the WebSocket upload path, which
+  refuses collisions too.
+- With `overwrite=1` the bytes are written to a dot-prefixed `.part` temp beside
+  the target and renamed over it only after the transfer completes, so an
+  interrupted replace never damages the file being replaced.
+- Uploads into `/.crosspoint` (the device's own configuration directory) are
+  refused, as are paths containing `..`.
 - EPUB cache data for the uploaded path is cleared after a successful upload.
 - HTTP upload uses a 4 KB write buffer before flushing to the SD card.
 

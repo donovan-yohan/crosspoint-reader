@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 #include "CrossPointSettings.h"
 #include "FontInstaller.h"
@@ -655,6 +656,47 @@ static bool flushUploadBuffer(CrossPointWebServer::UploadState& state) {
   return true;
 }
 
+namespace {
+// Upload targets the web API refuses outright, however the request is spelled.
+//
+// /.crosspoint is where settings.json, wifi.json and state.json live -- i.e. the
+// mailbox capability URL, the saved WiFi passphrases and the AP passphrase. The
+// upload endpoint has no authentication and transfer mode raises an OPEN AP, so
+// "any station in range may rewrite the reader's configuration" is not a
+// trade-off this endpoint gets to make. Nothing legitimate uploads there: the
+// stores own their own files and the browser UI never navigates into a dot
+// directory.
+constexpr char PROTECTED_DIR[] = "/.crosspoint";
+
+bool startsWithNoCase(const String& value, const char* prefix) {
+  const size_t n = strlen(prefix);
+  if (value.length() < static_cast<int>(n)) return false;
+  for (size_t i = 0; i < n; ++i) {
+    if (tolower(static_cast<unsigned char>(value[i])) != tolower(static_cast<unsigned char>(prefix[i]))) return false;
+  }
+  return true;
+}
+
+// A ".." anywhere in a path segment, or a '/' inside the multipart filename, is
+// a traversal attempt: neither the browser UI nor either app sender ever emits
+// one, so this refuses rather than tries to normalise.
+bool hasTraversal(const String& path) {
+  if (path.indexOf("..") >= 0) return true;
+  return false;
+}
+
+// True when the composed destination is one this endpoint will not write.
+bool isProtectedTarget(const String& filePath) {
+  if (startsWithNoCase(filePath, PROTECTED_DIR)) {
+    const int n = static_cast<int>(strlen(PROTECTED_DIR));
+    // "/.crosspointish/x" is not the config directory; "/.crosspoint" and
+    // "/.crosspoint/..." are.
+    if (filePath.length() == n || filePath[n] == '/') return true;
+  }
+  return false;
+}
+}  // namespace
+
 void CrossPointWebServer::handleUpload(UploadState& state) const {
   static size_t lastLoggedSize = 0;
 
@@ -677,6 +719,9 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     state.size = 0;
     state.success = false;
     state.error = "";
+    state.destPath = "";
+    state.writePath = "";
+    state.replaceOnEnd = false;
     uploadStartTime = millis();
     lastLoggedSize = 0;
     state.bufferPos = 0;
@@ -703,25 +748,79 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     LOG_DBG("WEB", "[UPLOAD] START: %s to path: %s", state.fileName.c_str(), state.path.c_str());
     LOG_DBG("WEB", "[UPLOAD] Free heap: %d bytes", ESP.getFreeHeap());
 
+    // Traversal and the config directory are refused before anything is opened.
+    // This endpoint is unauthenticated and transfer mode raises an OPEN AP, so
+    // the only thing between a station in radio range and /.crosspoint/wifi.json
+    // is this check.
+    if (state.fileName.isEmpty() || state.fileName.indexOf('/') >= 0 || hasTraversal(state.fileName) ||
+        hasTraversal(state.path)) {
+      state.error = "Invalid upload path";
+      LOG_DBG("WEB", "[UPLOAD] Rejected path: %s / %s", state.path.c_str(), state.fileName.c_str());
+      return;
+    }
+
     String filePath = state.path;
     if (!filePath.endsWith("/")) filePath += "/";
     filePath += state.fileName;
 
-    // Open file for writing. openFileForWrite opens with O_TRUNC, so this
-    // overwrites any existing file - senders can upload straight over a file
-    // (e.g. /.love-notes/current.frame) without a prior delete. A partial write
-    // from an interrupted upload leaves a truncated file, which the love-note
-    // reader rejects via its exact-size (52272 byte) check, same as before.
-    // This can be slow due to FAT cluster allocation.
-    resetTaskWatchdogIfSubscribed();
-    if (!Storage.openFileForWrite("WEB", filePath, state.file)) {
-      state.error = "Failed to create file on SD card";
-      LOG_DBG("WEB", "[UPLOAD] FAILED to create file: %s", filePath.c_str());
+    if (isProtectedTarget(filePath)) {
+      state.error = "This location is not writable over the network";
+      LOG_DBG("WEB", "[UPLOAD] Refused protected target: %s", filePath.c_str());
       return;
     }
+
+    // COLLISION IS REFUSED BY DEFAULT, exactly as it was before the messenger
+    // work and exactly as the WebSocket upload path still is (onWebSocketEvent's
+    // "ERROR:File already exists"). Dropping that refusal made every existing
+    // file on the card silently clobberable by an unauthenticated POST, and made
+    // a dropped Wi-Fi link mid-transfer destroy the user's original: O_TRUNC
+    // lands at the first byte, and an aborted upload then removed the path.
+    //
+    // A sender that genuinely means "replace this file" says so with
+    // ?overwrite=1, and even then the bytes never touch the target: they go to a
+    // dot-prefixed temp beside it and are renamed over it only after a clean
+    // UPLOAD_FILE_END. So an interrupted replace costs a temp file, never the
+    // original.
+    const bool overwriteRequested = server->hasArg("overwrite") && server->arg("overwrite") != "0";
+    String writePath = filePath;
+    bool replaceOnEnd = false;
+
+    resetTaskWatchdogIfSubscribed();
+    if (Storage.exists(filePath.c_str())) {
+      if (!overwriteRequested) {
+        // Refused BEFORE state.writePath is set: the cleanup paths delete
+        // state.writePath, and a refused collision must never make the file
+        // already on the card look like something this upload created.
+        state.error = "File already exists: " + state.fileName;
+        LOG_DBG("WEB", "[UPLOAD] Collision: %s", filePath.c_str());
+        return;
+      }
+      writePath = state.path;
+      if (!writePath.endsWith("/")) writePath += "/";
+      writePath += ".";
+      writePath += state.fileName;
+      writePath += ".part";
+      replaceOnEnd = true;
+      // A temp left behind by an earlier interrupted replace is ours to reuse.
+      if (Storage.exists(writePath.c_str())) Storage.remove(writePath.c_str());
+    }
+
+    // Open file for writing (openFileForWrite is O_TRUNC, which is what the temp
+    // wants). This can be slow due to FAT cluster allocation.
+    resetTaskWatchdogIfSubscribed();
+    if (!Storage.openFileForWrite("WEB", writePath, state.file)) {
+      state.error = "Failed to create file on SD card";
+      LOG_DBG("WEB", "[UPLOAD] FAILED to create file: %s", writePath.c_str());
+      return;
+    }
+    // Recorded only once the handle is open, so nothing downstream can delete a
+    // path this upload never created.
+    state.destPath = filePath;
+    state.writePath = writePath;
+    state.replaceOnEnd = replaceOnEnd;
     resetTaskWatchdogIfSubscribed();
 
-    LOG_DBG("WEB", "[UPLOAD] File created successfully: %s", filePath.c_str());
+    LOG_DBG("WEB", "[UPLOAD] File created successfully: %s", state.writePath.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (state.file && state.error.isEmpty()) {
       // Buffer incoming data and flush when buffer is full
@@ -767,6 +866,20 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
       }
       state.file.close();
 
+      if (state.error.isEmpty() && state.replaceOnEnd) {
+        // The one moment the target is touched, and it is two metadata ops long
+        // rather than the whole transfer: remove + rename. A power loss inside
+        // this window is the residual, and it is what the delete-then-upload
+        // contract this replaces exposed for the entire transfer.
+        resetTaskWatchdogIfSubscribed();
+        Storage.remove(state.destPath.c_str());
+        if (!Storage.rename(state.writePath.c_str(), state.destPath.c_str())) {
+          state.error = "Failed to replace the existing file on SD card";
+          LOG_ERR("WEB", "[UPLOAD] rename %s -> %s failed", state.writePath.c_str(), state.destPath.c_str());
+          Storage.remove(state.writePath.c_str());
+        }
+      }
+
       if (state.error.isEmpty()) {
         state.success = true;
         const unsigned long elapsed = millis() - uploadStartTime;
@@ -778,22 +891,24 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
                 writePercent);
 
         // Clear epub cache after uploading the file
-        String filePath = state.path;
-        if (!filePath.endsWith("/")) filePath += "/";
-        filePath += state.fileName;
-        clearBookCache(filePath.c_str());
+        clearBookCache(state.destPath.c_str());
       }
+    }
+    // A mid-transfer SD failure closes the file inside the WRITE branch, so the
+    // block above is skipped -- but a temp from a replace is still on the card.
+    if (!state.error.isEmpty() && state.replaceOnEnd && !state.writePath.isEmpty()) {
+      Storage.remove(state.writePath.c_str());
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     state.bufferPos = 0;  // Discard buffered data
     if (state.file) {
       state.file.close();
-      // Try to delete the incomplete file
-      String filePath = state.path;
-      if (!filePath.endsWith("/")) filePath += "/";
-      filePath += state.fileName;
-      Storage.remove(filePath.c_str());
     }
+    // Delete only what THIS upload created: the temp on a replace, or the new
+    // file on a fresh upload. Never the destination of a replace -- an aborted
+    // transfer used to remove it outright, which turned a dropped Wi-Fi link
+    // into permanent loss of the file the user was replacing.
+    if (!state.writePath.isEmpty()) Storage.remove(state.writePath.c_str());
     state.error = "Upload aborted";
     LOG_DBG("WEB", "Upload aborted");
   }

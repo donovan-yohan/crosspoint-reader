@@ -38,6 +38,18 @@ class CrossPointWebServer {
     bool success = false;
     String error = "";
 
+    // The path the finished file must end up at, and the path the bytes are
+    // actually written to. They differ ONLY on an explicit ?overwrite=1 upload,
+    // where the incoming bytes go to a dot-prefixed temp beside the target and
+    // are renamed over it on a clean UPLOAD_FILE_END. Held as state rather than
+    // recomputed per callback so END and ABORTED cannot disagree with START
+    // about which file they are touching (the query args are gone by then).
+    String destPath;
+    String writePath;
+    // True when writePath is a temp that must be renamed over destPath at END
+    // and removed (leaving destPath untouched) on any failure.
+    bool replaceOnEnd = false;
+
     // Upload write buffer - batches small writes into larger SD card operations
     // 4KB is a good balance: large enough to reduce syscall overhead, small enough
     // to keep individual write times short and avoid watchdog issues
