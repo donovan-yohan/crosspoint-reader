@@ -90,6 +90,18 @@ std::string PeerProbe::discoverBase(const std::string& configuredBase, uint32_t 
     return std::string();
   }
 
+  // THE WHOLE RANGE IS SWEPT, not "the first responder wins", and the sweep
+  // refuses to choose when more than one station answers as a forwarder.
+  //
+  // The health probe proves only that something on this AP speaks five lines of
+  // HTTP containing the token "cp-proxy". Returning the first responder meant a
+  // station that joined before the user's phone was silently PREFERRED to the
+  // phone, and it then received the capability URL on every poll and got to
+  // serve whatever frames and manifests it liked. Ambiguity is not something
+  // this code can resolve -- there is nothing to tell the two apart -- so it
+  // fails closed and the panel keeps saying "looking for the app", which is the
+  // honest thing to show while a second device is squatting the link.
+  std::string found;
   for (uint8_t i = 0; i < MAX_LEASES; ++i) {
     if (expired(deadline)) {
       LOG_DBG("PEER", "discovery deadline spent after %u candidates", static_cast<unsigned>(i));
@@ -105,11 +117,23 @@ std::string PeerProbe::discoverBase(const std::string& configuredBase, uint32_t 
     origin += std::to_string(port);
 
     // boxId-free, every time, for every candidate -- see the security note in the
-    // header. The capability path is only ever appended AFTER this returns true.
+    // header. The capability path is only ever appended AFTER the sweep has
+    // settled on exactly one answer.
     if (isProxy(origin, deadlineWithin(deadline, CANDIDATE_BUDGET_MS))) {
-      origin.append(path);
-      return origin;
+      if (!found.empty()) {
+        LOG_ERR("PEER", "two stations answer as the forwarder; refusing to pick one");
+        return std::string();
+      }
+      found = std::move(origin);
     }
+  }
+
+  if (!found.empty()) {
+    // A deadline that cut the sweep short after one match is still a usable
+    // answer: the alternative is refusing a link the user is standing in front
+    // of because a lease that was never probed MIGHT have answered.
+    found.append(path);
+    return found;
   }
 
   LOG_DBG("PEER", "no proxy found on the peer link");

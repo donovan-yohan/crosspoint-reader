@@ -31,11 +31,25 @@
 // an epub of its choosing. The staging gates bound the damage -- a frame must match
 // the live panel buffer size exactly, a book must match the manifest's bytes -- but
 // the manifest comes from the same peer, so "a book the user did not send" is
-// reachable. The other half of A3's finding is a per-device PSK on the AP
-// (AP_PASSWORD is a compile-time nullptr today, i.e. an open network), which is a
-// provisioning-side change and lives outside this unit. It is REQUIRED before any
-// unattended variant of the peer path; the foreground mode is watched by the user
-// who started it, which is the only reason it can ship first.
+// reachable. The other half of A3's finding is a per-device PSK on the AP, and
+// MailboxSyncActivity now raises the mode's AP with one (transfer mode's AP is
+// still open, but it runs no proxy discovery).
+//
+// THE PSK IS NOT A STRONG SECRET, and the rest of this design should not be read
+// as though it were. It is displayed in plaintext on the panel and encoded into a
+// scannable QR every session, it is stable for the life of the device, and WPA2-PSK
+// lets any station that knows it decrypt another station's traffic once it has seen
+// a handshake -- and this transport is deliberately plain HTTP, so the capability
+// URL is passively readable by such a station even without winning discovery.
+// Anyone who has stood near one sync session can rejoin every later one. Closing
+// that needs a session-scoped secret the forwarder has to echo back (i.e. an app
+// protocol change), not a firmware-side tweak. What IS closed here: discovery
+// refuses to choose when more than one station answers as a forwarder, so a
+// squatter cannot silently take the phone's place by holding the lower lease.
+//
+// The mode is a FOREGROUND one, watched by the user who started it, which is what
+// makes the residual acceptable for now; an unattended variant of the peer path
+// would need the echo first.
 //
 // Plain HTTP, deliberately: TLS terminates on the phone, which has a real stack, a
 // CA store and keep-alive. There is no handshake to pay on the peer link, which is
@@ -76,8 +90,10 @@ constexpr size_t MAX_HEALTH_BYTES = 64;
 bool isProxy(const std::string& origin, uint32_t deadline);
 
 // Probe this AP's DHCP range for the forwarder and compose the base to speak the
-// mailbox contract at. Returns "" when no station answered, when the deadline is
-// spent, or when `configuredBase` has no path to forward.
+// mailbox contract at. Returns "" when no station answered, when TWO OR MORE
+// answered (ambiguous: the reader cannot tell the user's phone from a squatter,
+// so it refuses rather than guessing), when the deadline is spent before any
+// answer, or when `configuredBase` has no path to forward.
 //
 // The result is `http://{peerIp}:{port}` + pathOf(configuredBase), because the
 // forwarder passes /m/* through VERBATIM: one capability URL, one budget, no
