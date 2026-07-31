@@ -127,6 +127,25 @@ size_t contentRangeTotal(const std::string& value) {
   return static_cast<size_t>(strtoul(value.c_str() + slash + 1, nullptr, 10));
 }
 
+// START offset out of a 206's Content-Range ("bytes 655360-1874232/1874233"),
+// or SIZE_MAX when the header is absent/unparseable.
+//
+// The total was being read and the start ignored, so a server or middlebox that
+// answered "bytes=N-" with a slice starting somewhere ELSE had its bytes appended
+// at the resume offset regardless. The result is a file that is corrupt in the
+// middle yet exactly the length the manifest promises -- and a size match is the
+// only integrity gate the contract affords, so nothing downstream catches it.
+size_t contentRangeStart(const std::string& value) {
+  const size_t space = value.find(' ');
+  if (space == std::string::npos || space + 1 >= value.size()) return SIZE_MAX;
+  const char* p = value.c_str() + space + 1;
+  if (*p < '0' || *p > '9') return SIZE_MAX;  // "*" (a 416) has no start
+  char* end = nullptr;
+  const unsigned long start = strtoul(p, &end, 10);
+  if (end == p || end == nullptr || *end != '-') return SIZE_MAX;
+  return static_cast<size_t>(start);
+}
+
 #if defined(FREEINK_NET_WOLFSSL)
 HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std::string& username,
                                          const std::string& password, Sink& sink) {
@@ -185,7 +204,22 @@ HttpDownloader::DownloadError runGetWolf(const std::string& startUrl, const std:
             sink.headersRead = true;
             // On a 206 Content-Length is the SLICE length, not the file size, so
             // a resume at 90% would otherwise report progress starting from 0.
-            if (sink.acceptPartial) sink.total = contentRangeTotal(http.getHeader("content-range"));
+            if (sink.acceptPartial) {
+              const std::string contentRange = http.getHeader("content-range");
+              if (bodyStatus == 206) {
+                // A slice that does not start where we asked is not usable at the
+                // offset the file is positioned at. Reported as "the server
+                // ignored the Range" because the recovery is identical: the
+                // caller restarts the file from 0. Stopped before the first byte,
+                // so the partial on the card is left exactly as it was.
+                const size_t start = contentRangeStart(contentRange);
+                if (start != sink.rangeStart) {
+                  sink.rangeIgnored = true;
+                  return false;
+                }
+              }
+              sink.total = contentRangeTotal(contentRange);
+            }
             if (sink.total == 0 && http.hasContentLength()) {
               sink.total = http.getContentLength();
               // Content-Range was absent or unparseable and we fell back to
