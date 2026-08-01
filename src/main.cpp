@@ -35,6 +35,7 @@
 #include "images/LoadingIcon.h"
 #include "network/BookSync.h"
 #include "network/MessageSync.h"
+#include "network/WallpaperSync.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -303,6 +304,22 @@ void enterDeepSleep(bool fromTimeout = false) {
     // across windows, promoted only on an exact size match. Returns early when
     // too little budget survives the note phase to be worth a handshake.
     BookSync::syncOnLink(base, sleepSyncDeadline);
+
+    // Then wallpapers, on whatever is left after that, against the SAME deadline
+    // -- so this adds no time to the sleep-entry window and cannot push the
+    // number SLEEP_SYNC_WINDOW_MS documents. Both halves gate themselves on
+    // MIN_USEFUL_MS, so this is a no-op on a sleep that spent its whole transfer
+    // budget on a book.
+    //
+    // SAY THE CONSEQUENCE PLAINLY: while a multi-window book is draining, no
+    // wallpaper moves at sleep entry. That is the right trade for the unattended
+    // path -- the alternative is a longer window with the panel already showing
+    // the sleep screen, and main.cpp's own comment above says why that number has
+    // to stay small. Wallpapers still drain in the foreground Sync-with-app and
+    // Mailbox-sync session, which has a 30 minute cap and gives each phase its own
+    // budget per poll, and at sleep entry on any sleep with no book in flight --
+    // which is every sleep once the library has caught up.
+    WallpaperSync::syncOnLink(base, sleepSyncDeadline);
   };
   MessageSync::syncBeforeSleep(display.getBufferSize(), sleepSyncDeadline, whileLinkUp);
 

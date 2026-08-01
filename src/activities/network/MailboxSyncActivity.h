@@ -17,11 +17,15 @@
 // link comes up differently -- a headless STA connect to a saved network, or a
 // softAP the phone joins -- and after that every single thing is identical: the
 // same poll cadence, the same MessageSync::syncOnLink, the same
-// BookSync::syncOnLink, the same staging, the same progress screen, the same
-// session cap, the same teardown. `Transport` selects a base URL and nothing else.
+// BookSync::syncOnLink, the same WallpaperSync::syncOnLink, the same staging, the
+// same progress screen, the same session cap, the same teardown. `Transport`
+// selects a base URL and nothing else.
 //
 // WHAT THE USER SEES, AND WHAT THEY DELIBERATELY DO NOT. Books land in /books and
 // are readable the moment the mode exits, because a book is a file in a library.
+// A wallpaper lands in its slot here too, but by its nature it can only be SEEN
+// at the next sleep; the counts line is the receipt, and the panel is no more
+// hijacked to preview it than it is to preview a note.
 // A note does NOT render here: contract 3A routes every note through the sleep
 // screen, so a note staged during a sync takes its one turn on the panel at the
 // next sleep-entry (SleepActivity, keyed on the note id) and the progress screen
@@ -166,7 +170,7 @@ class MailboxSyncActivity final : public Activity {
     WaitingPhone,  // AP only: AP is up, SSID + PSK on the panel, no station yet.
     Linking,       // AP only: a station joined; probing the leases for the forwarder.
     Polling,       // Link up, base known, nothing in flight.
-    Receiving,     // A book window is running; targetName is on the panel.
+    Receiving,     // A book or wallpaper window is running; targetName is on the panel.
     Stalled,       // Consecutive failed polls. Still trying -- not an exit.
     Failed,        // Terminal. failureText says why; Back is the only way out.
     Finished,      // Session cap spent. Shows the counts.
@@ -185,13 +189,19 @@ class MailboxSyncActivity final : public Activity {
   std::string base;         // Empty until the link is up and the base is composed.
   std::string apSsid;       // AP transport only, shown on the panel.
   std::string apPsk;        // Shown on the panel. Per DEVICE: APP_STATE.mailboxApPsk.
-  std::string targetName;   // Book currently being received, for the Receiving state.
+  std::string targetName;   // Book or wallpaper being received, for the Receiving state.
   size_t targetBytes = 0;   // ...and its size, so the panel can show "1.2 / 4.0 MB".
   size_t targetHave = 0;
   StrId failureText = StrId::STR_SYNC_FINISHED;  // Meaningful only in State::Failed.
 
   int notesStaged = 0;
   int booksReceived = 0;
+  // Wallpapers actually APPLIED this session, not merely downloaded: a blob that
+  // arrived complete and failed the BMP parse is not something to congratulate the
+  // user about. Rendered on its own line and only once it is non-zero, so the
+  // established two-label counts line keeps its layout for every session that
+  // never receives one.
+  int wallpapersApplied = 0;
 
   // The network handed over on this session, empty until one has been saved. Both
   // the "did it happen" flag and the panel line, because there is exactly one
@@ -242,14 +252,15 @@ class MailboxSyncActivity final : public Activity {
     size_t have;
     int notes;
     int books;
+    int wallpapers;
     StrId failure;
     size_t wifiHash;
     bool operator==(const PaintSignature& o) const {
       return state == o.state && nameHash == o.nameHash && have == o.have && notes == o.notes && books == o.books &&
-             failure == o.failure && wifiHash == o.wifiHash;
+             wallpapers == o.wallpapers && failure == o.failure && wifiHash == o.wifiHash;
     }
   };
-  PaintSignature painted{State::Finished, 0, 0, -1, -1, StrId::STR_SYNC_FINISHED, 0};
+  PaintSignature painted{State::Finished, 0, 0, -1, -1, -1, StrId::STR_SYNC_FINISHED, 0};
 
   PaintSignature signature() const;
   // The ONLY paint call site. Blocking (requestUpdateAndWait) so the panel really

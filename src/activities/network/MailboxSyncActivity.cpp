@@ -20,6 +20,7 @@
 #include "network/HttpDownloader.h"
 #include "network/MessageSync.h"
 #include "network/PeerProbe.h"
+#include "network/WallpaperSync.h"
 #include "util/QrUtils.h"
 #include "util/TaskWatchdog.h"
 
@@ -636,18 +637,26 @@ void MailboxSyncActivity::runPollCycle() {
   // The window gets the standard budget capped by what is left of the session, so
   // MIN_USEFUL_MS ("too little budget left to be worth a window") effectively only
   // fires when the cap is nearly spent.
-  bool targetReported = false;
-  BookSync::Progress progress;
-  progress.onTarget = [this, &targetReported](const std::string& filename, size_t bytes, size_t have) {
-    targetReported = true;
-    targetName = filename;
+  // Shared by both transfer phases below, because they paint the same three
+  // fields into the same Receiving state -- the only thing the user cares about is
+  // "this named thing is arriving, this far along", and a book and a wallpaper are
+  // the same sentence.
+  const auto announceTarget = [this](const std::string& name, const size_t bytes, const size_t have) {
+    targetName = name;
     targetBytes = bytes;
     targetHave = have;
     state = State::Receiving;
-    // Paint here, before the transfer, so the panel names the book while the bytes
-    // are moving instead of after. It costs one refresh out of the window budget,
-    // and only when something on the screen actually changed.
+    // Paint here, before the transfer, so the panel names the target while the
+    // bytes are moving instead of after. It costs one refresh out of the window
+    // budget, and only when something on the screen actually changed.
     paintIfChanged();
+  };
+
+  bool bookTargetReported = false;
+  BookSync::Progress progress;
+  progress.onTarget = [&](const std::string& filename, size_t bytes, size_t have) {
+    bookTargetReported = true;
+    announceTarget(filename, bytes, have);
   };
   progress.shouldAbort = [this] { return pollForAbort(); };
 
@@ -658,6 +667,31 @@ void MailboxSyncActivity::runPollCycle() {
     LOG_INF("MSYNCUI", "Book promoted (%d this session)", booksReceived);
   }
 
+  if (expired(sessionDeadline)) return;
+
+  // ONE WALLPAPER PER POLL, after the books, on its own budget. Last of the three
+  // phases because it is the least latency-sensitive: a note is a message someone
+  // is waiting on, a book is a thing the user asked for, and a wallpaper only has
+  // to be in place by the next time the reader sleeps.
+  bool wallpaperTargetReported = false;
+  WallpaperSync::Progress wallpaperProgress;
+  wallpaperProgress.onTarget = [&](const std::string& filename, const bool primary, size_t bytes, size_t have) {
+    wallpaperTargetReported = true;
+    // A primary carries no filename on the wire -- it is a single fixed slot -- so
+    // the panel names it by what it is. WallpaperSync deliberately holds no I18n
+    // table; this is the only place that decision costs anything.
+    announceTarget(primary ? std::string(tr(STR_SYNC_WALLPAPER)) : filename, bytes, have);
+  };
+  wallpaperProgress.shouldAbort = [this] { return pollForAbort(); };
+
+  const bool wallpaperApplied =
+      WallpaperSync::syncOnLink(base, deadlineWithin(sessionDeadline, WallpaperSync::WINDOW_BUDGET_MS),
+                                wallpaperProgress);
+  if (wallpaperApplied) {
+    wallpapersApplied++;
+    LOG_INF("MSYNCUI", "Wallpaper applied (%d this session)", wallpapersApplied);
+  }
+
   // A BOOK BIGGER THAN ONE WINDOW STAYS ON THE SCREEN BETWEEN WINDOWS, and that is
   // the whole reason this is not simply "back to waiting". Dropping to Polling
   // after every window would repaint twice per cadence for a book that is plainly
@@ -666,10 +700,18 @@ void MailboxSyncActivity::runPollCycle() {
   // Receiving instead, so the only signature change is `have` growing: exactly one
   // repaint per window, showing real progress.
   //
-  // Left when the book is promoted, or when a cycle passes without BookSync naming
-  // a target at all -- which is how "there is nothing left to fetch" arrives, and
-  // the only thing that stops a finished book's name from sticking on the panel.
-  if (state == State::Receiving && (promoted || !targetReported)) {
+  // Left when the thing currently named on the panel finishes, or when a cycle
+  // passes without EITHER phase naming a target at all -- which is how "there is
+  // nothing left to fetch" arrives, and the only thing that stops a finished
+  // transfer's name from sticking on the panel.
+  //
+  // WHICHEVER PHASE SPOKE LAST OWNS THE SCREEN, which is why this is not simply
+  // `promoted || wallpaperApplied`. A cycle that promotes a book and then starts a
+  // wallpaper leaves the wallpaper's name on the panel and must stay in Receiving;
+  // clearing on the book's completion would blank a transfer that is still running.
+  const bool namedTargetFinished =
+      wallpaperTargetReported ? wallpaperApplied : (bookTargetReported ? promoted : false);
+  if (state == State::Receiving && (namedTargetFinished || (!bookTargetReported && !wallpaperTargetReported))) {
     state = State::Polling;
     targetName.clear();
     targetBytes = 0;
@@ -865,8 +907,8 @@ void MailboxSyncActivity::teardownRadio() {
 // --- Paint -----------------------------------------------------------------
 
 MailboxSyncActivity::PaintSignature MailboxSyncActivity::signature() const {
-  return PaintSignature{state,         hashName(targetName), targetHave, notesStaged,
-                        booksReceived, failureText,          hashName(wifiSavedSsid)};
+  return PaintSignature{state,         hashName(targetName), targetHave,  notesStaged,
+                        booksReceived, wallpapersApplied,    failureText, hashName(wifiSavedSsid)};
 }
 
 void MailboxSyncActivity::paintIfChanged() {
@@ -938,9 +980,9 @@ void MailboxSyncActivity::renderBody(const int contentTop) const {
   renderer.drawCenteredText(UI_10_FONT_ID, y, statusLine(), true, EpdFontFamily::BOLD);
   y += lineHeight + metrics.verticalSpacing;
 
-  // The book being received, named. Nothing equivalent exists for a note on
-  // purpose: a note has no user-visible name, and the only honest thing to say
-  // about one is when it will appear.
+  // The book or wallpaper being received, named. Nothing equivalent exists for a
+  // note on purpose: a note has no user-visible name, and the only honest thing to
+  // say about one is when it will appear.
   if (state == State::Receiving && !targetName.empty()) {
     renderer.drawCenteredText(UI_10_FONT_ID, y, targetName.c_str());
     y += lineHeight;
@@ -962,6 +1004,17 @@ void MailboxSyncActivity::renderBody(const int contentTop) const {
            tr(STR_SYNC_BOOKS_LABEL), booksReceived);
   renderer.drawCenteredText(UI_10_FONT_ID, y, counts);
   y += lineHeight;
+
+  // Wallpapers get their own line rather than a third column, and only once one
+  // has landed. The counts line is centred and already carries two labels with
+  // their numbers; widening it to three would reflow the layout of every session,
+  // including the overwhelming majority that never receive a wallpaper at all.
+  if (wallpapersApplied > 0) {
+    char wallpaperCount[64];
+    snprintf(wallpaperCount, sizeof(wallpaperCount), "%s: %d", tr(STR_SYNC_WALLPAPERS_LABEL), wallpapersApplied);
+    renderer.drawCenteredText(UI_10_FONT_ID, y, wallpaperCount);
+    y += lineHeight;
+  }
 
   // The network the phone handed over, named, because it is the one thing in this
   // whole mode the user cannot verify anywhere else until they next need it. Shown
