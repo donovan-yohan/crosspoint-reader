@@ -25,6 +25,7 @@
 #include "util/TaskWatchdog.h"
 
 using MailboxSync::CYCLE_DRAIN_BUDGET_MS;
+using MailboxSync::MAX_ACTIVE_CYCLES;
 using MailboxSync::MAX_ITEMS_PER_CYCLE;
 using MailboxSync::MAX_WIFI_BODY_BYTES;
 using MailboxSync::PEER_DISCOVERY_MS;
@@ -410,9 +411,22 @@ void MailboxSyncActivity::loop() {
       // Demonstrably non-empty: re-arm the warm window too, because whatever put
       // one item there is quite likely still putting more.
       idleCycles = 0;
-      nextPollAt = millis() + POLL_ACTIVE_MS;
+      // THE ZERO INTERVAL IS RATIONED, because "completed" is not quite the
+      // never-repeats signal it reads as -- all three sync modules report an item
+      // that landed but could not be RECORDED as a success, on purpose, and that
+      // one does repeat every cycle. See MAX_ACTIVE_CYCLES. An uninterrupted run
+      // of claimed completions past the ration is the shape of that failure and
+      // not of any real backlog, so the cadence stops spending zero on it and
+      // spends the warm interval instead.
+      if (activeCycles < MAX_ACTIVE_CYCLES) {
+        ++activeCycles;
+        nextPollAt = millis() + POLL_ACTIVE_MS;
+      } else {
+        nextPollAt = millis() + POLL_WARM_MS;
+      }
       break;
     case CycleResult::Idle:
+      activeCycles = 0;
       if (idleCycles < POLL_WARM_CYCLES) {
         ++idleCycles;
         nextPollAt = millis() + POLL_WARM_MS;
@@ -424,6 +438,7 @@ void MailboxSyncActivity::loop() {
       // Not "the mailbox is empty" -- see STALL_THRESHOLD. Spend the warm window
       // so a link that comes back does not get a second free run of fast polls,
       // and back off now.
+      activeCycles = 0;
       idleCycles = POLL_WARM_CYCLES;
       nextPollAt = millis() + POLL_IDLE_MS;
       break;
@@ -456,6 +471,9 @@ bool MailboxSyncActivity::startSavedNetworkLink() {
   // point of it: the seconds right after the link comes up are when a queue the
   // sender is still filling is most likely to gain an item.
   idleCycles = 0;
+  // A fresh link gets a fresh zero-interval ration, for the same reason the probe
+  // budget is per-link: whatever exhausted it belonged to the previous link.
+  activeCycles = 0;
   nextPollAt = millis();
   LOG_INF("MSYNCUI", "STA link up, syncing against the configured mailbox");
   return true;
@@ -657,6 +675,8 @@ void MailboxSyncActivity::stepPhoneApLink() {
     // eagerly: the app is open in the user's hand and its queue is being filled
     // right now. Arms the warm window; the first poll below is immediate.
     idleCycles = 0;
+    // And a fresh zero-interval ration with it -- see startSavedNetworkLink.
+    activeCycles = 0;
     // A re-discovered base is the only point at which the thing on the other end
     // can have become a different phone, or the same phone with something staged
     // that was not staged before. It is therefore the one place the pickup's

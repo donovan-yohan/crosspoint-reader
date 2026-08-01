@@ -83,6 +83,37 @@ namespace MailboxSync {
 // yields between cycles regardless of what this number says.
 constexpr uint32_t POLL_ACTIVE_MS = 0;
 
+// HOW MANY CYCLES MAY RUN BACK-TO-BACK AT POLL_ACTIVE_MS BEFORE THE CADENCE
+// STOPS TRUSTING "MOVED", and it exists because the premise under
+// POLL_ACTIVE_MS is not universally true.
+//
+// The premise is "a completed item cannot repeat, because it is recorded in an
+// id-keyed state file and never fetched again". That holds on every path where
+// the record lands -- and all three sync modules DELIBERATELY report success
+// when the body landed but the record did not, because the item genuinely did
+// arrive and losing it would be worse than re-fetching it. Read the three
+// sites: BookSync.cpp promote() ("promoted but not recorded ... re-fetched next
+// window"), WallpaperSync.cpp applyEntry() ("applied but not recorded"), and
+// MessageSync.cpp promoteIncoming(), which drops the id sidecar when its write
+// fails so the frame reads as unseen. Each of those is a completion that DOES
+// repeat, every cycle, for as long as the SD card keeps refusing the small
+// write while accepting the large one.
+//
+// A fixed poll interval used to rate-limit that to one repeat per interval. A
+// zero interval does not, so the same failing card would be re-downloading and
+// re-writing at link speed for the rest of the session cap -- which is the one
+// thing a device with a sick filesystem must not be made to do. This bounds the
+// zero-interval run instead: after this many consecutive cycles that all claim
+// to have moved something, the cadence drops to POLL_WARM_MS, which is still
+// five times faster than the old fixed interval.
+//
+// Sized so no real backlog can reach it: MAX_ITEMS_PER_CYCLE items per cycle
+// means 8 x 3 = 24 items drain with no interval at all, and a queue past that
+// pays POLL_WARM_MS per three items -- a few hundred ms against transfers that
+// dominate it. The counter is cleared by any cycle that does NOT complete
+// something, so it only ever counts an uninterrupted run.
+constexpr uint8_t MAX_ACTIVE_CYCLES = 8;
+
 // The first POLL_WARM_CYCLES cycles that find nothing, counted from link-up and
 // re-armed by every completed item. A phone typically finishes uploading into its
 // own queue a beat AFTER the reader has linked to it, so the seconds right after
@@ -102,20 +133,41 @@ constexpr uint32_t POLL_IDLE_MS = 4000;
 
 // HOW MANY ITEMS ONE CYCLE MAY DRAIN. BookSync and WallpaperSync each fetch at
 // most one item per call by design, so "one call each per cycle" put a hard
-// one-item-per-interval ceiling on the whole mode. Three, because the worst case
-// has to stay honest: three passes of a book window plus a wallpaper window is
-// 3 x (20 + 20) s, which with the note pass in front of it keeps a cycle inside
-// ~70 s against today's ~51 s -- and the note pass at the head of the NEXT cycle
-// is what a person waiting on a message is waiting for, so a cycle must not be
-// allowed to grow without bound. Anything past three lands on the next cycle,
-// which POLL_ACTIVE_MS starts immediately.
+// one-item-per-interval ceiling on the whole mode. Three passes of a book window
+// plus a wallpaper window would be 3 x (20 + 20) = 120 s of windows if every one
+// of them ran long, so THE ITEM COUNT IS NOT WHAT KEEPS A CYCLE HONEST --
+// CYCLE_DRAIN_BUDGET_MS IS, and it cuts the drain at 40 s however many passes
+// are left. What this number bounds is the number of manifest round trips a
+// single cycle can spend, and three is where that stops paying: anything past it
+// lands on the next cycle, which POLL_ACTIVE_MS starts with no interval at all.
+// The pair puts the worst-case cycle at the note pass plus the drain budget,
+// 10 + 40 = 50 s, against the 10 + 20 + 20 + 4 = 54 s that shipped.
 constexpr uint8_t MAX_ITEMS_PER_CYCLE = 3;
 
 // Wall-clock bound on the drain loop, capped by the session deadline like every
 // other budget here. MAX_ITEMS_PER_CYCLE bounds the number of windows and this
 // bounds their total time, so neither a slow link nor a manifest full of large
 // books can hold one cycle open indefinitely.
-constexpr uint32_t CYCLE_DRAIN_BUDGET_MS = 60000;
+//
+// AND THE NUMBER IS SET BY NOTE STARVATION, NOT BY THE DRAIN. The note pass runs
+// at the HEAD of a cycle and nowhere else, so this budget is exactly how long a
+// note that arrives one moment too late waits behind books before anyone asks
+// for it again. That gap used to be one book window plus one wallpaper window
+// plus the poll interval: 20 + 20 + 4 = 44 s. Draining three items per cycle
+// makes the books ahead of it longer, and a zero interval after them takes only
+// the 4 s back -- so at 60000 the gap grew to 60 s and this mode got SLOWER at
+// the one thing it exists for, which is delivering a message someone is waiting
+// on. 40000 is chosen so it cannot: 40 + 0 = 40 s is strictly better than the
+// 44 s that shipped.
+//
+// It costs the drain nothing in the case the drain was written for. Three small
+// books over a one-hop peer link are seconds, not minutes, so the item count is
+// what binds and all three still land in one cycle. The only case this cuts
+// short is three consecutive SLOW books -- which is precisely the case where a
+// waiting note should get the link back, and it is not even a delay: the next
+// cycle starts at POLL_ACTIVE_MS, so the books resume immediately after the note
+// pass they now let through.
+constexpr uint32_t CYCLE_DRAIN_BUDGET_MS = 40000;
 
 // Hard session cap, a safety net rather than a budget: the mode holds the radio
 // up and preventAutoSleep() asserted for its whole life, so it must not be able
@@ -340,6 +392,11 @@ class MailboxSyncActivity final : public Activity {
   // link-up and by every completed item, which is what makes the warm window
   // "just after something interesting happened" rather than "once per session".
   uint8_t idleCycles = 0;
+  // Consecutive cycles that COMPLETED something, capped at MAX_ACTIVE_CYCLES.
+  // The brake on the zero interval: see MAX_ACTIVE_CYCLES for why a completion
+  // is not the never-repeats signal POLL_ACTIVE_MS would like it to be. Cleared
+  // by any cycle that completes nothing, so an ordinary backlog never reaches it.
+  uint8_t activeCycles = 0;
   // Consecutive failed discovery sweeps on this link. Drives both the retry
   // interval and the per-candidate probe budget down from fast to patient, and is
   // cleared by a sweep that found the forwarder or by the station leaving.
