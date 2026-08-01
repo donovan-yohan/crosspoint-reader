@@ -24,6 +24,7 @@
 #include "TextSettingsActivity.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/IntervalSelectionActivity.h"
+#include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -314,10 +315,22 @@ void SettingsActivity::toggleCurrentSetting() {
     return;
   }
 
+  if (setting.type == SettingType::STRING) {
+    openStringEditor(setting);
+    return;
+  }
+
   if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
     // Toggle the boolean value using the member pointer
     const bool currentValue = SETTINGS.*(setting.valuePtr);
     SETTINGS.*(setting.valuePtr) = !currentValue;
+    // Audit line. A toggle is a one-press, unconfirmed, persisted state change,
+    // and some of these rows govern features with no other tell -- flipping
+    // messageSyncEnabled takes unattended mailbox sync offline permanently and
+    // changes nothing a user can see. INF so it survives into release builds and
+    // into the RTC log ring, which is what makes "when did this get switched
+    // off" answerable at all after the fact.
+    LOG_INF("SETTINGS", "Toggle %s -> %s", setting.key ? setting.key : "(unkeyed)", currentValue ? "off" : "on");
   } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
     const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
     if (setting.enumValues.size() > 2) {
@@ -462,6 +475,72 @@ void SettingsActivity::openSleepTimeoutPicker() {
       });
 }
 
+std::string SettingsActivity::stringSettingValue(const SettingInfo& setting) {
+  // Whichever store backs the entry: a dynamic entry answers through its getter, a
+  // char[] entry is read out of SETTINGS at the recorded offset. An entry with
+  // neither has nothing to show and reads empty rather than dereferencing &SETTINGS.
+  if (setting.stringGetter) return setting.stringGetter();
+  if (setting.stringOffset > 0 && setting.stringMaxLen > 0) {
+    return {reinterpret_cast<const char*>(&SETTINGS) + setting.stringOffset};
+  }
+  return {};
+}
+
+// String entries are edited on the same keyboard the Wi-Fi and KOReader screens
+// use -- the settings list only has to point it at this entry's store. Until this
+// existed every STRING entry was inert on the device (the branch below used to
+// fall through to `return`), which is why they were all left category-less.
+void SettingsActivity::openStringEditor(const SettingInfo& setting) {
+  // Copied out before the child activity starts: `setting` is a reference into
+  // currentSettings, and rebuildSettingsLists() in the handler replaces that vector.
+  const std::string current = stringSettingValue(setting);
+  const auto stringSetter = setting.stringSetter;
+  const size_t stringOffset = setting.stringOffset;
+  const size_t maxLen = setting.stringMaxLen;
+  const StrId nameId = setting.nameId;
+  const StrId invalidHintId = setting.invalidHintId;
+
+  startActivityForResult(
+      // maxLen 0 means "unbounded" to the keyboard, which is exactly what a char[]
+      // entry must never be -- those carry their capacity, dynamic ones opt in.
+      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, I18N.get(nameId), current, maxLen,
+                                              InputType::Text),
+      [this, stringSetter, stringOffset, maxLen, nameId, invalidHintId](const ActivityResult& result) {
+        if (result.isCancelled) {
+          requestUpdate();
+          return;
+        }
+
+        const auto& kb = std::get<KeyboardResult>(result.data);
+        bool accepted = true;
+        if (stringSetter) {
+          accepted = stringSetter(kb.text);
+        } else if (maxLen > 0 && stringOffset > 0) {
+          char* ptr = reinterpret_cast<char*>(&SETTINGS) + stringOffset;
+          strncpy(ptr, kb.text.c_str(), maxLen - 1);
+          ptr[maxLen - 1] = '\0';
+        }
+
+        if (!accepted) {
+          // A refused value is shown, never swallowed: the keyboard would otherwise
+          // just close over the old value, which reads as a save that vanished. The
+          // hint carries the rule the entry expects; without one, the entry's own
+          // name at least says which row refused.
+          const char* acknowledge = tr(STR_CONFIRM);
+          optionPopup.show(I18N.get(invalidHintId != StrId::STR_NONE_OPT ? invalidHintId : nameId), &acknowledge, 1, 0,
+                           [](int) {});
+          requestUpdate();
+          return;
+        }
+
+        // Dynamic entries persist inside their own setter; this covers the char[]
+        // ones, which live in SETTINGS.
+        SETTINGS.saveToFile();
+        rebuildSettingsLists();
+        requestUpdate();
+      });
+}
+
 void SettingsActivity::render(RenderLock&&) {
   if (optionPopup.processRender(renderer, mappedInput)) return;
 
@@ -520,18 +599,26 @@ void SettingsActivity::render(RenderLock&&) {
           } else {
             valueText = std::to_string(SETTINGS.*(setting.valuePtr));
           }
+        } else if (setting.type == SettingType::STRING) {
+          // Shown in the clear. The one string that reaches this list is the AP
+          // passphrase the user is meant to read off the panel and type into a
+          // phone, so hiding it behind dots would defeat the row.
+          valueText = stringSettingValue(setting);
+          if (valueText.empty()) valueText = tr(STR_NONE_OPT);
         }
         return valueText;
       },
       true);
 
-  // Draw help text
-  const auto confirmLabel =
-      (selectedSettingIndex == 0)
-          ? I18N.get(categoryNames[(selectedCategoryIndex + 1) % categoryCount])
-          : (selectedSettingIndex > 0 && (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_TIME_TO_SLEEP
-                 ? tr(STR_SELECT)
-                 : tr(STR_TOGGLE));
+  // Draw help text. "Select" for the rows that open something (the sleep-timeout
+  // picker, the keyboard); "Toggle" for the ones Confirm changes in place.
+  const bool opensEditor =
+      selectedSettingIndex > 0 &&
+      ((*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_TIME_TO_SLEEP ||
+       (*currentSettings)[selectedSettingIndex - 1].type == SettingType::STRING);
+  const auto confirmLabel = (selectedSettingIndex == 0)
+                                ? I18N.get(categoryNames[(selectedCategoryIndex + 1) % categoryCount])
+                                : (opensEditor ? tr(STR_SELECT) : tr(STR_TOGGLE));
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

@@ -18,6 +18,7 @@
 #include <builtinFonts/all.h>
 
 #include <cstring>
+#include <string>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -32,6 +33,8 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
+#include "network/BookSync.h"
+#include "network/MessageSync.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -170,6 +173,23 @@ void waitForPowerRelease() {
 
 constexpr char SLEEP_FRAME_FILE[] = "/.crosspoint/sleep_frame.bin";
 
+// Hard cap on the whole sleep-entry sync: connect + notes + the A2 repaint +
+// the books window. The contract's own headline number -- ~8 s of fixed cost
+// (<= 6 s connect plus a TLS handshake) plus BookSync::WINDOW_BUDGET_MS of
+// transfer. It is a wall-clock bound, passed into syncBeforeSleep and enforced
+// inside every body read loop under it (both halves: the note GETs take it too),
+// not a hope based on the 60 s per-socket-op timeout. One documented exception,
+// and only for an https mailbox: the wolfSSL handshake caps itself internally at
+// 15 s per method attempt and nothing outside SecureClient can shorten that, so a
+// connect that hangs mid-handshake can overrun this by that much. Everything else
+// -- DNS/TCP connect, status line, body, stalls -- is clamped to what is left.
+//
+// The panel already shows the sleep screen for all of it, so the device looks
+// asleep throughout; that is exactly why the number must stay small enough that a
+// POWER press landing inside the window is a rare annoyance rather than the normal
+// experience.
+constexpr uint32_t SLEEP_SYNC_WINDOW_MS = 8000 + BookSync::WINDOW_BUDGET_MS;
+
 static void saveSleepFrameBuffer() {
   HalFile file;
   if (!Storage.openFileForWrite("SLP", SLEEP_FRAME_FILE, file)) return;
@@ -207,11 +227,84 @@ void enterDeepSleep(bool fromTimeout = false) {
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
-  activityManager.goToSleep(fromTimeout);
+  activityManager.goToSleep(fromTimeout);  // also cancels any armed Path B check
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
   }
+
+  // M2 #1 (messenger): sleep-sync. goToSleep() above already painted the sleep
+  // screen (blocking e-ink refresh), so the bounded WiFi window is hidden from
+  // the user who walked away. Only reached for a real reading-session sleep: the
+  // go-back-to-sleep gates in setup() call startDeepSleep() directly and never
+  // enter here. Deep sleep fully resets the chip, so the post-WiFi fragmented
+  // heap is discarded on the next wake -- no silentRestart needed. syncBeforeSleep
+  // leaves WiFi off; the teardown below is a safety net.
+  //
+  // M2 #3 (books, contract section 3): the books window rides the SAME
+  // association, inside the hook, so the <= 6 s connect budget and the TLS
+  // handshake are paid once for both halves. The whole window -- connect, notes,
+  // the A2 repaint and books -- is capped at SLEEP_SYNC_WINDOW_MS from here.
+  const uint32_t sleepSyncDeadline = millis() + SLEEP_SYNC_WINDOW_MS;
+  const MessageSync::LinkUpHook whileLinkUp = [&](const std::string& base, const bool stagedNewNote) {
+    // M2 #2 Path A2 (contract section 3A): goToSleep() above painted the sleep
+    // screen BEFORE the sync, so a note that just landed is staged but is not on
+    // the panel yet. Repaint it exactly once, and only on the sleeps where a note
+    // actually arrived: the user walking away sees the wallpaper resolve into the
+    // note. Cost is one extra ~1.7 s HALF refresh, no radio. Keeping this ordering
+    // (paint, sync, repaint) rather than syncing first is deliberate -- syncing
+    // first would leave the last reading frame on the panel for the whole bounded
+    // WiFi window, so the device would look awake-but-frozen instead of asleep.
+    //
+    // The repaint runs BEFORE the books window, not after it: a note is a
+    // 52 KB frame the user is waiting to see, a book window is up to 20 s of
+    // transfer. Books-first would hold a just-arrived note off the panel for the
+    // whole download, for no gain -- the radio stays associated across the
+    // ~1.7 s refresh either way.
+    //
+    // Never on a quick-resume sleep: saveSleepFrameBuffer() above already
+    // snapshotted the pre-sync panel, so a repaint here would leave sleep_frame.bin
+    // (and, on the X3, the differential-refresh baseline restored from it at wake)
+    // desynced from what is physically on the panel. A quick-resume sleep means
+    // "put the screen back exactly as it was", so the note keeps its unspent turn
+    // and takes the next normal sleep instead. SleepActivity::onEnter enforces the
+    // same rule on the selection side.
+    //
+    // M2 #4: this is the second of the two paint sites, and it asks the SAME
+    // display-once question SleepActivity just asked, for the same reason -- a
+    // note gets exactly one turn, keyed on its id. stagedNewNote alone would be
+    // very nearly right (the note this sync promoted is new by construction), but
+    // routing both sites through noteAwaitingDisplay() is what makes "one turn"
+    // a property of the id rather than of two call sites agreeing. The id is
+    // recorded after the refresh, so this note reverts to wallpaper next sleep.
+    if (stagedNewNote && !isQuickResumeSleep && MessageSync::noteAwaitingDisplay()) {
+      bool painted = false;
+      {
+        RenderLock lock;
+        if (MessageSync::loadStagedNote(display.getFrameBuffer(), display.getBufferSize())) {
+          renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+          painted = true;
+        }
+      }
+      // The turn is consumed AFTER the render lock is released, never inside it.
+      // markStagedNoteDisplayed() writes the id sidecar to SD and then calls
+      // APP_STATE.saveToFile(), which takes PersistableStore's storeMutex --
+      // and PersistableStore.h says in as many words that storeMutex must not be
+      // acquired on the render path (the storeMutex/storageMutex ordering
+      // hazard). SleepActivity's paint site already calls this outside any
+      // RenderLock, so the two sites now agree instead of disagreeing.
+      //
+      // Display-once is untouched: the id is still recorded only when the panel
+      // physically took the frame, and still before deep sleep begins.
+      if (painted) MessageSync::markStagedNoteDisplayed();
+    }
+
+    // Whatever is left of the window goes to books: at most one book, resumed
+    // across windows, promoted only on an exact size match. Returns early when
+    // too little budget survives the note phase to be worth a handshake.
+    BookSync::syncOnLink(base, sleepSyncDeadline);
+  };
+  MessageSync::syncBeforeSleep(display.getBufferSize(), sleepSyncDeadline, whileLinkUp);
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
@@ -307,7 +400,25 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+
   APP_STATE.loadFromFile();
+
+  // M2 #2 (messenger, contract section 3A): there is deliberately NO wake-time
+  // note interrupt here any more. A staged note was already on the panel when the
+  // user picked the device up; a note never renders live and never interrupts, so
+  // waking is just a normal wake into whatever they were reading.
+  // MessageDisplayActivity survives only as an optional viewer.
+  // The Path B silent check is armed at the very end of setup(), and only on the
+  // branch that lands at the launcher.
+  //
+  // M2 #4: boot paints no sleep/lock image at all -- the two boot presentations
+  // are the splash (BootActivity) and the quick-resume restore of
+  // /.crosspoint/sleep_frame.bin below, neither of which consults the mailbox.
+  // The note's turn is therefore decided in exactly one place, at sleep-entry,
+  // and it is display-once because APP_STATE.messageLastDisplayedId -- loaded on
+  // the line above -- survives the boot. A device that boots holding a note it
+  // has already shown paints the configured wallpaper at its next sleep.
+
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
@@ -405,6 +516,14 @@ void setup() {
       break;
   }
 
+  // M2 #2 Path B gate: a note check may run ONLY when this boot lands at the
+  // launcher. This is a RAM constraint, not a UX nicety -- WiFi and an EPUB
+  // chapter build must never be resident at once on ~50 KB of free heap, so the
+  // resume-into-the-reader branches below must never arm one. Set per branch
+  // rather than inferred from the routing target, because there are two goHome
+  // and two goToReader sites here and only one goHome is a real wake.
+  bool landedAtLauncher = false;
+
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
     activityManager.replaceActivity(
@@ -419,11 +538,15 @@ void setup() {
     // target == home (or reader with no open book): land on home — don't fall
     // through to the sleep-wake "resume reader" logic, which fires on stale
     // openEpubPath + lastSleepFromReader from a prior session.
+    // landedAtLauncher stays false: a silent reboot is a heap-defrag restart on
+    // the way out of a WiFi activity, not a wake, and that activity just had the
+    // radio up. Nothing to check for.
     activityManager.goHome();
   } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
     // crashed (indicated by readerActivityLoadCount > 0)
+    landedAtLauncher = true;
     activityManager.goHome();
   } else {
     // Clear app state to avoid getting into a boot loop if the epub doesn't load
@@ -454,6 +577,30 @@ void setup() {
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
   allowSleepAt = millis() + 2000;
+
+  // M2 #2 Path B: arm the silent note check, last thing before loop() takes over.
+  // Deliberately after the go-back-to-sleep gates and the recovery-mode escape
+  // above -- both of those never reach here, so a re-sleeping wake never pays for
+  // a check and the UP+POWER bootloop escape is never delayed. Zero UI: the only
+  // observable effect is that the NEXT sleep-entry has a newer note to lock with.
+  // Nothing is fetched here; stepWakeCheck() in loop() does the work, and any
+  // activity transition cancels it with the radio down (ActivityManager).
+  //
+  // The openEpubPath gate is the heap-ordering rule from contract 3A. landedAtLauncher
+  // alone is not enough: three of its four causes (last sleep not from the reader,
+  // Back held, a reader crash) leave openEpubPath NON-empty, and in all three the
+  // user's first action at the launcher is to reopen that book -- so a chapter build
+  // would run on a heap a TLS session had just fragmented. WIFI_OFF does not
+  // defragment and silentRestart() cannot be used here (it would trample the
+  // launcher), so there would be no recovery from an OOM. Arming only when no book
+  // is one keypress away costs those wakes their silent check -- the note then
+  // arrives on the sleep-entry sync instead, i.e. no worse than before Path B
+  // existed. Loosening this needs the post-check heap number stepWakeCheck() now
+  // logs, measured on a device against a following chapter build; there is no
+  // runtime evidence for the tighter version either way.
+  if (landedAtLauncher && APP_STATE.openEpubPath.empty()) {
+    MessageSync::beginWakeCheck(display.getBufferSize());
+  }
 }
 
 void loop() {
@@ -493,7 +640,10 @@ void loop() {
   // Check for any user activity (button press or release) or active background work
   static unsigned long lastActivityTime = millis();
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity() || halTiltSensor.hadActivity() ||
-      activityManager.preventAutoSleep()) {
+      activityManager.preventAutoSleep() || MessageSync::wakeCheckActive()) {
+    // An armed Path B check counts as background work: it keeps the CPU off the
+    // idle downclock (the radio needs the full clock) and holds off auto-sleep for
+    // the at most 8 s the check can live, so a sleep can't land mid-transfer.
     lastActivityTime = millis();         // Reset inactivity timer
     powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
   }
@@ -556,6 +706,14 @@ void loop() {
   if (gpio.wasUsbStateChanged()) {
     activityManager.requestUpdate();
   }
+
+  // M2 #2 Path B: one non-blocking step of the armed note check. Placed after the
+  // sleep guards above so a sleep gesture always wins, and immediately before
+  // activityManager.loop() so that when an activity dispatches input into a
+  // transition (Home -> reader), the cancel inside replaceActivity() tears the
+  // radio down before the incoming activity's onEnter() ever runs. No-op unless a
+  // check is armed.
+  MessageSync::stepWakeCheck();
 
   const unsigned long activityStartTime = millis();
   activityManager.loop();

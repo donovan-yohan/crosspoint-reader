@@ -12,6 +12,22 @@
 
 enum class SettingType { TOGGLE, ENUM, ACTION, VALUE, STRING };
 
+// What GET /api/settings sends instead of the value of a secret-bearing string
+// entry, and what POST /api/settings reads as "the client is holding the mask,
+// leave the stored value alone".
+//
+// The web API has no authentication and transfer mode raises an OPEN AP, so
+// every string it emits is readable by anyone in radio range. Most settings are
+// preferences; three are not. mailboxApPsk is the passphrase for the sync AP,
+// messageSyncUrl is a bearer capability the user cannot rotate from the device
+// (possession of it is possession of every note and every book), and koPassword
+// is an account password. Those are marked withObfuscated() and masked here.
+//
+// A sentinel rather than an empty string on purpose: this POST handler applies
+// every key PRESENT in the body, and a browser that round-trips the whole
+// document would otherwise CLEAR the secret it was never shown.
+constexpr char SETTINGS_MASKED_VALUE[] = "••••••••";
+
 enum class SettingAction {
   None,
   RemapFrontButtons,
@@ -46,6 +62,9 @@ struct SettingInfo {
   StrId category = StrId::STR_NONE_OPT;  // Category for web UI grouping
   bool obfuscated = false;               // Save/load via base64 obfuscation (passwords)
   bool inTextSettings = false;           // Surfaced in the Text Settings screen; hidden from the flat Reader list
+  // Shown on-device when stringSetter refuses a value: the rule the entry expects,
+  // so a refusal explains itself instead of looking like a dropped keystroke.
+  StrId invalidHintId = StrId::STR_NONE_OPT;
 
   // Direct char[] string fields (for settings stored in CrossPointSettings)
   size_t stringOffset = 0;
@@ -55,10 +74,19 @@ struct SettingInfo {
   std::function<uint8_t()> valueGetter;
   std::function<void(uint8_t)> valueSetter;
   std::function<std::string()> stringGetter;
-  std::function<void(const std::string&)> stringSetter;
+  // Returns false to REFUSE the value, leaving the stored one untouched. Every
+  // caller must honour that: a setter that validates is the only place a bad
+  // string can be stopped, and a silently dropped refusal reads to the user as a
+  // save that worked. Setters with nothing to validate just return true.
+  std::function<bool(const std::string&)> stringSetter;
 
   SettingInfo& withObfuscated() {
     obfuscated = true;
+    return *this;
+  }
+
+  SettingInfo& withInvalidHint(StrId hintId) {
+    invalidHintId = hintId;
     return *this;
   }
 
@@ -136,14 +164,18 @@ struct SettingInfo {
     return s;
   }
 
+  // maxLen bounds the on-device keyboard only (0 = unbounded). It is NOT a
+  // truncation budget the way SettingInfo::String's is: a dynamic entry has no
+  // char[] to overrun, so the setter still owns the final say on what it accepts.
   static SettingInfo DynamicString(StrId nameId, std::function<std::string()> getter,
-                                   std::function<void(const std::string&)> setter, const char* key = nullptr,
-                                   StrId category = StrId::STR_NONE_OPT) {
+                                   std::function<bool(const std::string&)> setter, const char* key = nullptr,
+                                   StrId category = StrId::STR_NONE_OPT, size_t maxLen = 0) {
     SettingInfo s;
     s.nameId = nameId;
     s.type = SettingType::STRING;
     s.stringGetter = std::move(getter);
     s.stringSetter = std::move(setter);
+    s.stringMaxLen = maxLen;
     s.key = key;
     s.category = category;
     return s;
@@ -175,6 +207,8 @@ class SettingsActivity final : public Activity {
   void enterCategory(int categoryIndex);
   void toggleCurrentSetting();
   void openSleepTimeoutPicker();
+  void openStringEditor(const SettingInfo& setting);
+  static std::string stringSettingValue(const SettingInfo& setting);
   void rebuildSettingsLists();
   void syncQuickResumeTimeoutForSleepScreen(bool sleepScreenChanged, bool quickResumeTimeoutChanged);
 

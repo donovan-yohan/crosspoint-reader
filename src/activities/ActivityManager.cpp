@@ -14,10 +14,12 @@
 #include "home/HomeActivity.h"
 #include "home/RecentBooksActivity.h"
 #include "network/CrossPointWebServerActivity.h"
+#include "network/MessageSync.h"
 #include "reader/ReaderActivity.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
 #include "util/FullScreenMessageActivity.h"
+#include "util/MessageDisplayActivity.h"
 
 static portMUX_TYPE activityManagerSpinlock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -171,6 +173,15 @@ void ActivityManager::exitActivity(const RenderLock& lock) {
 }
 
 void ActivityManager::replaceActivity(std::unique_ptr<Activity>&& newActivity) {
+  // M2 #2: any navigation away from the launcher ends the Path B note check, and
+  // it must end here -- synchronously, at the user's decision -- rather than on
+  // the next loop() iteration. WiFi and an EPUB chapter build must never be
+  // resident at once (~50 KB free heap, ~51 KB framebuffer), so the radio has to
+  // be down before the incoming activity's onEnter() runs a few lines below. This
+  // also keeps the check from fighting a WiFi activity for the radio. No-op when
+  // no check is armed, which is the overwhelmingly common case.
+  MessageSync::cancelWakeCheck();
+
   // Note: no lock here, this is usually called by loop() and we may run into deadlock
   if (currentActivity) {
     // Defer launch if we're currently in an activity, to avoid deleting the current activity
@@ -223,6 +234,12 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
   replaceActivity(std::make_unique<FullScreenMessageActivity>(renderer, mappedInput, std::move(message), style));
 }
 
+void ActivityManager::goToMessage() {
+  // pushActivity (not replaceActivity) keeps the underlying activity on the
+  // stack so MessageDisplayActivity::finish() returns to it.
+  pushActivity(std::make_unique<MessageDisplayActivity>(renderer, mappedInput));
+}
+
 void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
   if (initialMenuItem == HomeMenuItem::NONE && currentActivity) {
     const auto& activityName = currentActivity->name;
@@ -243,6 +260,7 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
 void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
 void ActivityManager::pushActivity(std::unique_ptr<Activity>&& activity) {
+  MessageSync::cancelWakeCheck();  // same reasoning as replaceActivity()
   if (pendingActivity) {
     // Should never happen in practice
     LOG_ERR("ACT", "pendingActivity while pushActivity is not expected");
