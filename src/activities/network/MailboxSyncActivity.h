@@ -43,9 +43,11 @@
 // structural here rather than a rule someone has to remember.
 namespace MailboxSync {
 
-// Poll cadence. Both polls are tiny by contract -- latest.txt is <= 128 B and
-// books.txt is capped at 8192 B on the reader -- so a round trip is ~4 KB of
-// payload, which is the only reason 4 s is affordable at all.
+// POLL CADENCE, AND IT IS ADAPTIVE RATHER THAN FIXED.
+//
+// Both polls are tiny by contract -- latest.txt is <= 128 B and books.txt is
+// capped at 8192 B on the reader -- so a round trip is ~4 KB of payload, which is
+// the only reason a 4 s idle cadence is affordable at all.
 //
 // ON THE STA TRANSPORT THIS IS STILL EXPENSIVE, AND IT IS A KNOWN GAP.
 // SecureHttpClient is stack-local inside HttpDownloader's hop loop, so keep-alive
@@ -53,7 +55,67 @@ namespace MailboxSync {
 // for those 4 KB. A3's peer link has no handshake at all -- it is plain HTTP,
 // TLS terminates on the phone -- so G6 is a constraint on the internet transport
 // only, and the peer transport is the one this cadence was chosen for.
-constexpr uint32_t POLL_INTERVAL_MS = 4000;
+//
+// WHY THREE NUMBERS AND NOT ONE. A single fixed interval was charged to the case
+// it is worst for. The loop used to sleep the interval UNCONDITIONALLY, including
+// straight after a cycle that had just transferred something -- and because each
+// window fetches at most one item, a mailbox holding N items cost at least N x
+// interval of pure idling on top of the transfers themselves. The user's report
+// is that exact arithmetic: "sync with app takes a long time from starting it to
+// items landing". The interval is a POWER measure for an idle link, and an idle
+// link is the only thing it should be charged to.
+//
+// THE SAME THREE NUMBERS ON BOTH TRANSPORTS. A4 is emphatic that the transports
+// must not fork after the link is up, and cadence is named in that list, so the
+// policy here is transport-independent on purpose. The STA transport pays its
+// handshake per poll either way; what a warm cadence costs there is bounded by
+// the handshake itself (the interval is measured from the END of the previous
+// cycle, so a 3 s cycle at POLL_WARM_MS is a 3.75 s effective cadence, not a
+// 0.75 s one) and it is spent only in the first few cycles of a session the user
+// deliberately started and is standing over.
+
+// After a cycle that COMPLETED something: go again with no interval at all. The
+// queue is demonstrably non-empty, the reader is awake, the radio is up and the
+// user is watching -- there is nothing to save by waiting. Not a busy-spin, and
+// structurally so: a cycle that completed an item necessarily did a manifest
+// round trip and a body transfer, and main.cpp's loop() ends in delay(10) on
+// every iteration (this activity does not request skipLoopDelay), so the task
+// yields between cycles regardless of what this number says.
+constexpr uint32_t POLL_ACTIVE_MS = 0;
+
+// The first POLL_WARM_CYCLES cycles that find nothing, counted from link-up and
+// re-armed by every completed item. A phone typically finishes uploading into its
+// own queue a beat AFTER the reader has linked to it, so the seconds right after
+// the link comes up are precisely when "nothing yet" is most likely to become
+// "something" -- and 750 ms of a plain-HTTP round trip on a one-hop link is a few
+// KB. 8 x 750 ms is a ~6 s warm window, which covers a user tapping send in the
+// app while watching the reader.
+constexpr uint32_t POLL_WARM_MS = 750;
+constexpr uint8_t POLL_WARM_CYCLES = 8;
+
+// Genuinely idle: the warm window is spent and nothing has arrived. This is the
+// old fixed interval, unchanged, and it is still what a long unattended session
+// settles at -- the power argument for it has not changed, only the set of cycles
+// it is charged to. Also the retry interval for a FAILED poll, so the stall
+// threshold below still measures the ~12 s it was written for.
+constexpr uint32_t POLL_IDLE_MS = 4000;
+
+// HOW MANY ITEMS ONE CYCLE MAY DRAIN. BookSync and WallpaperSync each fetch at
+// most one item per call by design, so "one call each per cycle" put a hard
+// one-item-per-interval ceiling on the whole mode. Three, because the worst case
+// has to stay honest: three passes of a book window plus a wallpaper window is
+// 3 x (20 + 20) s, which with the note pass in front of it keeps a cycle inside
+// ~70 s against today's ~51 s -- and the note pass at the head of the NEXT cycle
+// is what a person waiting on a message is waiting for, so a cycle must not be
+// allowed to grow without bound. Anything past three lands on the next cycle,
+// which POLL_ACTIVE_MS starts immediately.
+constexpr uint8_t MAX_ITEMS_PER_CYCLE = 3;
+
+// Wall-clock bound on the drain loop, capped by the session deadline like every
+// other budget here. MAX_ITEMS_PER_CYCLE bounds the number of windows and this
+// bounds their total time, so neither a slow link nor a manifest full of large
+// books can hold one cycle open indefinitely.
+constexpr uint32_t CYCLE_DRAIN_BUDGET_MS = 60000;
 
 // Hard session cap, a safety net rather than a budget: the mode holds the radio
 // up and preventAutoSleep() asserted for its whole life, so it must not be able
@@ -67,6 +129,32 @@ constexpr uint32_t SESSION_CAP_MS = 30UL * 60UL * 1000UL;
 // the app, accepting the system join dialog.
 constexpr uint32_t PHONE_JOIN_WAIT_MS = 120000;
 constexpr uint32_t PEER_DISCOVERY_MS = 8000;
+
+// HOW OFTEN AN ASSOCIATED-BUT-SILENT STATION IS RE-PROBED, and it is deliberately
+// NOT the poll cadence any more.
+//
+// The two were the same variable, which meant the reader waited a full 4 s poll
+// interval between "the phone associated" and "ask it again whether its listener
+// is up". A phone opens that listener within about a second of association --
+// often after it, because the system join dialog resolves before the app's server
+// binds -- so the single most common way to lose several seconds in this mode was
+// to probe once, a moment too early, and then sit out a poll interval. Retrying
+// twice a second for the first PEER_FAST_ATTEMPTS covers that window with attempts
+// instead of with waiting.
+//
+// THE TOTAL BUDGET IS NOT EXTENDED BY THIS. PEER_DISCOVERY_MS still bounds each
+// sweep, and once PEER_FAST_ATTEMPTS are spent both the retry interval
+// (POLL_IDLE_MS) and the per-candidate budget (PeerProbe::CANDIDATE_BUDGET_MS)
+// revert to exactly what they were, so a station that never answers costs the
+// same for the rest of the session as it always did.
+constexpr uint32_t PEER_RETRY_MS = 500;
+
+// How many sweeps run on the fast cadence and the short per-candidate budget
+// before discovery settles into its patient form. Eight covers roughly the first
+// four seconds after a station appears, which is several times the ~1 s a
+// foreground app needs to bind its listener; past that the phone is not merely
+// slow to start, and hammering it is neither faster nor free.
+constexpr uint8_t PEER_FAST_ATTEMPTS = 8;
 
 // WI-FI HANDOVER OVER THE PEER LINK -- the reason this feature exists is that a
 // Wi-Fi password is the single worst thing to type on e-ink. The phone already
@@ -118,6 +206,14 @@ constexpr size_t MAX_WIFI_BODY_BYTES = 128;
 // case: the credential is staged before the session starts, so the FIRST pickup
 // finds it. Re-armed on peer re-discovery, which is the event that means "this
 // is a different link now".
+//
+// THE GRACE THIS BUYS IS NOW MEASURED IN CYCLES THAT ARE CLOSER TOGETHER. Three
+// misses used to span ~12 s of the fixed interval and now span ~2 s of the warm
+// one. That is still the race it was written for -- the listener and the staging
+// are two pieces of in-process state on the same phone, set microseconds apart --
+// and the number stays at three because what it bounds (a TCP connect and an ERR
+// line at the head of the latency-sensitive note pass) is a per-attempt cost, not
+// a per-second one.
 constexpr uint8_t WIFI_PICKUP_MAX_MISSES = 3;
 
 // What the reader will accept as a credential. SSID is 1..32 bytes (802.11), and
@@ -176,6 +272,18 @@ class MailboxSyncActivity final : public Activity {
     Finished,      // Session cap spent. Shows the counts.
   };
 
+  // What one poll cycle turned out to be worth, which is the only input the
+  // cadence takes. Three outcomes and not two, because "the poll failed" must not
+  // be read as "the mailbox is empty": a failing link retried on the warm cadence
+  // would reach STALL_THRESHOLD in ~2 s and flash the stalled line at a user whose
+  // hotspot merely re-associated, which is the thing the threshold exists to
+  // prevent.
+  enum class CycleResult : uint8_t {
+    Moved,   // an item COMPLETED: a note staged, a book promoted, a wallpaper applied
+    Idle,    // the link is fine and there was nothing to take (or a transfer is still mid-flight)
+    Failed,  // the note pass did not get through
+  };
+
   const MailboxSync::Transport transport;
 
   State state = State::Connecting;
@@ -221,8 +329,21 @@ class MailboxSyncActivity final : public Activity {
   uint32_t sessionDeadline = 0;  // Absolute millis(); set once the activity starts.
   uint32_t phoneWaitDeadline = 0;
   uint32_t nextPollAt = 0;
+  // When the next peer-discovery sweep may run. SEPARATE FROM nextPollAt on
+  // purpose: they were one variable, which tied "how often do we ask the phone
+  // whether its listener is up" to "how often do we ask the mailbox for mail",
+  // and those two want opposite cadences. AP transport only.
+  uint32_t nextProbeAt = 0;
   uint32_t lastAbortPoll = 0;  // Throttles the in-transfer Back sampling.
   int consecutiveFailures = 0;
+  // Consecutive cycles that found nothing, capped at POLL_WARM_CYCLES. Zeroed by
+  // link-up and by every completed item, which is what makes the warm window
+  // "just after something interesting happened" rather than "once per session".
+  uint8_t idleCycles = 0;
+  // Consecutive failed discovery sweeps on this link. Drives both the retry
+  // interval and the per-candidate probe budget down from fast to patient, and is
+  // cleared by a sweep that found the forwarder or by the station leaving.
+  uint8_t probeAttempts = 0;
 
   bool linkStarted = false;  // Guards the one-shot bring-up out of the first loop().
   // AP transport: "the panel has already said we are looking for the app on this
@@ -271,7 +392,8 @@ class MailboxSyncActivity final : public Activity {
   bool startSavedNetworkLink();
   bool startPhoneApLink();
   void stepPhoneApLink();  // WaitingPhone -> Linking -> Polling, and back on a drop.
-  void runPollCycle();
+  // One poll cycle, and the answer the cadence is chosen from.
+  CycleResult runPollCycle();
   // One /cp-wifi pickup attempt, from the front of a poll cycle on the AP
   // transport. Everything about it is non-fatal to the session: a 404 (nothing
   // staged, or an app too old to serve the path) and a transport failure are the

@@ -24,10 +24,17 @@
 #include "util/QrUtils.h"
 #include "util/TaskWatchdog.h"
 
+using MailboxSync::CYCLE_DRAIN_BUDGET_MS;
+using MailboxSync::MAX_ITEMS_PER_CYCLE;
 using MailboxSync::MAX_WIFI_BODY_BYTES;
 using MailboxSync::PEER_DISCOVERY_MS;
+using MailboxSync::PEER_FAST_ATTEMPTS;
+using MailboxSync::PEER_RETRY_MS;
 using MailboxSync::PHONE_JOIN_WAIT_MS;
-using MailboxSync::POLL_INTERVAL_MS;
+using MailboxSync::POLL_ACTIVE_MS;
+using MailboxSync::POLL_IDLE_MS;
+using MailboxSync::POLL_WARM_CYCLES;
+using MailboxSync::POLL_WARM_MS;
 using MailboxSync::PSK_MAX_BYTES;
 using MailboxSync::PSK_MIN_BYTES;
 using MailboxSync::WIFI_PICKUP_MAX_MISSES;
@@ -142,6 +149,12 @@ constexpr int QR_SIZE = 180;
 // Consecutive failed note polls before the screen admits it is not getting
 // through. Three at a 4 s cadence is ~12 s, long enough that a single dropped
 // packet or a hotspot re-associating does not flash a scary line at the user.
+//
+// STILL ~12 s AFTER THE CADENCE WENT ADAPTIVE, and that is why a failed cycle
+// arms POLL_IDLE_MS rather than the warm interval: retrying a broken link five
+// times faster neither fixes it nor is free, and it would drag this threshold
+// down to ~2 s, which is well inside the ordinary recovery time of the events it
+// is meant to ride out.
 constexpr int STALL_THRESHOLD = 3;
 
 // How often Back is sampled from inside a book transfer. The download loop hands
@@ -384,8 +397,37 @@ void MailboxSyncActivity::loop() {
   }
 
   if (static_cast<int32_t>(millis() - nextPollAt) < 0) return;
-  runPollCycle();
-  nextPollAt = millis() + POLL_INTERVAL_MS;
+
+  // ADAPTIVE CADENCE. The interval is charged to an IDLE link and to nothing
+  // else: a cycle that completed something goes again with no wait at all, so a
+  // queued backlog drains back-to-back instead of one item per interval, and the
+  // idle interval only reappears once the mailbox has actually run dry. Every
+  // number is measured from the END of the cycle, so a cycle that took longer
+  // than its own interval simply runs again on the next loop() -- there is no
+  // catch-up burst and no accumulated debt.
+  switch (runPollCycle()) {
+    case CycleResult::Moved:
+      // Demonstrably non-empty: re-arm the warm window too, because whatever put
+      // one item there is quite likely still putting more.
+      idleCycles = 0;
+      nextPollAt = millis() + POLL_ACTIVE_MS;
+      break;
+    case CycleResult::Idle:
+      if (idleCycles < POLL_WARM_CYCLES) {
+        ++idleCycles;
+        nextPollAt = millis() + POLL_WARM_MS;
+      } else {
+        nextPollAt = millis() + POLL_IDLE_MS;
+      }
+      break;
+    case CycleResult::Failed:
+      // Not "the mailbox is empty" -- see STALL_THRESHOLD. Spend the warm window
+      // so a link that comes back does not get a second free run of fast polls,
+      // and back off now.
+      idleCycles = POLL_WARM_CYCLES;
+      nextPollAt = millis() + POLL_IDLE_MS;
+      break;
+  }
   paintIfChanged();
 }
 
@@ -410,6 +452,11 @@ bool MailboxSyncActivity::startSavedNetworkLink() {
 
   base = configured;
   state = State::Polling;
+  // The warm window starts at link-up on both transports, which is the whole
+  // point of it: the seconds right after the link comes up are when a queue the
+  // sender is still filling is most likely to gain an item.
+  idleCycles = 0;
+  nextPollAt = millis();
   LOG_INF("MSYNCUI", "STA link up, syncing against the configured mailbox");
   return true;
 }
@@ -486,6 +533,10 @@ bool MailboxSyncActivity::startPhoneApLink() {
   base.clear();
   state = State::WaitingPhone;
   phoneWaitDeadline = millis() + PHONE_JOIN_WAIT_MS;
+  // The first station to appear is probed the moment it appears; the fast retry
+  // budget starts unspent.
+  nextProbeAt = millis();
+  probeAttempts = 0;
   LOG_INF("MSYNCUI", "AP up as %s, waiting for a phone", apSsid.c_str());
   return true;
 }
@@ -502,6 +553,12 @@ void MailboxSyncActivity::stepPhoneApLink() {
     base.clear();
     state = State::WaitingPhone;
     phoneWaitDeadline = millis() + PHONE_JOIN_WAIT_MS;
+    // A rejoin is a fresh link, so it gets a fresh fast-probe budget: the phone
+    // that comes back is exactly the case the fast cadence is for, and carrying a
+    // spent counter across would make the second sync of a session slower than
+    // the first for no reason.
+    nextProbeAt = millis();
+    probeAttempts = 0;
     return;
   }
 
@@ -516,7 +573,7 @@ void MailboxSyncActivity::stepPhoneApLink() {
       }
       return;
     }
-    // A STATION IS ASSOCIATED BUT UNPROVEN, AND THE RETRY IS ON THE POLL CADENCE.
+    // A STATION IS ASSOCIATED BUT UNPROVEN, AND THE RETRY IS ON THE PROBE CADENCE.
     // Re-discovery used to run on every loop() iteration, so a station that
     // associates without answering /cp-proxy -- a phone that scanned the QR before
     // opening the app, an app still binding its listener, a backgrounded app, or a
@@ -525,7 +582,16 @@ void MailboxSyncActivity::stepPhoneApLink() {
     // because it is only consulted while no station is present. Two full-frame
     // repaints of two completely different layouts per attempt, forever: A4's
     // strobing-panel finding, exactly.
-    if (static_cast<int32_t>(millis() - nextPollAt) < 0) return;
+    //
+    // THE GATE IS nextProbeAt AND NOT nextPollAt, which is the fix for the other
+    // half of that story. Reusing the poll interval here meant an app whose
+    // listener came up 200 ms after the first probe waited 4 s for the second, and
+    // that is the single most common few seconds lost in this mode. The
+    // strobing-panel argument survives untouched: probeAnnounced latches on the
+    // first attempt, so attempts 2..N cost ZERO repaints no matter how close
+    // together they are -- the panel simply keeps showing the join screen, which
+    // is the honest thing to show while the app is not answering yet.
+    if (static_cast<int32_t>(millis() - nextProbeAt) < 0) return;
 
     LOG_INF("MSYNCUI", "A station joined; looking for the forwarder");
     state = State::Linking;
@@ -548,16 +614,31 @@ void MailboxSyncActivity::stepPhoneApLink() {
     // appendix A3's sharpest security finding, closed structurally rather than by
     // remembering to probe first.
     resetTaskWatchdogIfSubscribed();
+    // MORE ATTEMPTS OF SHORTER LENGTH, NOT A LONGER SEARCH. The sweep's own bound
+    // (PEER_DISCOVERY_MS) is unchanged; what changes is how long any ONE candidate
+    // may hold it up while the fast attempts last. A forwarder on a one-hop plain
+    // HTTP link answers in milliseconds, so a second is already generous, and
+    // spending the saving on another attempt half a second later is strictly
+    // better against a listener that is about to open than sitting on a socket
+    // that is never going to answer.
+    const bool fastPhase = probeAttempts < PEER_FAST_ATTEMPTS;
     const std::string peer =
-        PeerProbe::discoverBase(configuredUrl, deadlineWithin(sessionDeadline, PEER_DISCOVERY_MS));
+        PeerProbe::discoverBase(configuredUrl, deadlineWithin(sessionDeadline, PEER_DISCOVERY_MS),
+                                PeerProbe::PROXY_PORT,
+                                fastPhase ? PeerProbe::FAST_CANDIDATE_BUDGET_MS : PeerProbe::CANDIDATE_BUDGET_MS);
     if (peer.empty()) {
       // The station is associated but is not answering as a forwarder -- the app
       // is not open yet, or it is a device that just joined the network. Fall back
       // to waiting rather than failing: the phone is still there and the next
-      // attempt will try again -- ON THE POLL CADENCE, which is what this line
+      // attempt will try again -- ON THE PROBE CADENCE, which is what this line
       // arms. Without it the WaitingPhone gate above lets the sweep re-run
       // immediately and the panel strobes.
-      nextPollAt = millis() + POLL_INTERVAL_MS;
+      //
+      // The interval reverts to POLL_IDLE_MS once the fast attempts are spent, so
+      // a station that is simply never going to answer costs exactly what it
+      // always did for the remaining ~29 minutes of the session cap.
+      if (probeAttempts < PEER_FAST_ATTEMPTS) ++probeAttempts;
+      nextProbeAt = millis() + (probeAttempts < PEER_FAST_ATTEMPTS ? PEER_RETRY_MS : POLL_IDLE_MS);
       state = State::WaitingPhone;
       return;
     }
@@ -569,6 +650,13 @@ void MailboxSyncActivity::stepPhoneApLink() {
     // drop-and-rejoin its one "Looking for the app..." paint back.
     consecutiveFailures = 0;
     probeAnnounced = false;
+    // The fast-probe budget is spent per LINK, not per session, so the next
+    // drop-and-rejoin gets its quick sweeps back.
+    probeAttempts = 0;
+    // A link that has just come up is the strongest reason there is to poll
+    // eagerly: the app is open in the user's hand and its queue is being filled
+    // right now. Arms the warm window; the first poll below is immediate.
+    idleCycles = 0;
     // A re-discovered base is the only point at which the thing on the other end
     // can have become a different phone, or the same phone with something staged
     // that was not staged before. It is therefore the one place the pickup's
@@ -588,10 +676,20 @@ void MailboxSyncActivity::stepPhoneApLink() {
 
 // --- The poll cycle --------------------------------------------------------
 
-void MailboxSyncActivity::runPollCycle() {
-  if (base.empty()) return;
+MailboxSyncActivity::CycleResult MailboxSyncActivity::runPollCycle() {
+  if (base.empty()) return CycleResult::Idle;
 
   resetTaskWatchdogIfSubscribed();
+
+  // "Did this cycle COMPLETE anything." Deliberately not "did anything happen":
+  // a window that named a target and did not finish it is a resume, and calling
+  // that Moved would arm the zero-interval cadence on an outcome that can repeat
+  // forever (a manifest entry the server will never serve names a target every
+  // single window and completes none). A completed item cannot repeat -- it is
+  // recorded in the id-keyed state file and never fetched again -- so Moved is
+  // the one signal that is safe to spend a zero interval on. An in-flight
+  // transfer gets the warm cadence instead, by falling through as Idle.
+  bool completedSomething = false;
 
   // THE WI-FI HANDOVER GOES FIRST, AND ONLY ONCE PER SESSION. It is the smallest
   // request in the cycle -- one bounded local GET -- and it is the one the user is
@@ -615,7 +713,7 @@ void MailboxSyncActivity::runPollCycle() {
     if (++consecutiveFailures >= STALL_THRESHOLD && state == State::Polling) {
       state = State::Stalled;
     }
-    return;
+    return CycleResult::Failed;
   }
   consecutiveFailures = 0;
   if (state == State::Stalled) state = State::Polling;
@@ -627,16 +725,12 @@ void MailboxSyncActivity::runPollCycle() {
     // render it, and it must not -- MessageDisplayActivity paints a FULL_REFRESH
     // multi-flash waveform and would reintroduce the interrupting note.
     notesStaged++;
+    completedSomething = true;
     LOG_INF("MSYNCUI", "Note staged (%d this session)", notesStaged);
   }
 
-  if (expired(sessionDeadline)) return;
+  if (expired(sessionDeadline)) return completedSomething ? CycleResult::Moved : CycleResult::Idle;
 
-  // ONE BOOK PER POLL, by design: BookSync fetches at most one book per call, so a
-  // mailbox holding five books drains over five poll cycles rather than one sweep.
-  // The window gets the standard budget capped by what is left of the session, so
-  // MIN_USEFUL_MS ("too little budget left to be worth a window") effectively only
-  // fires when the cap is nearly spent.
   // Shared by both transfer phases below, because they paint the same three
   // fields into the same Receiving state -- the only thing the user cares about is
   // "this named thing is arriving, this far along", and a book and a wallpaper are
@@ -652,44 +746,100 @@ void MailboxSyncActivity::runPollCycle() {
     paintIfChanged();
   };
 
+  // DRAIN, RATHER THAN ONE ITEM PER INTERVAL.
+  //
+  // BookSync and WallpaperSync each fetch at most ONE item per call -- that is
+  // their contract and it is not changing, because "resume across bounded
+  // windows" is what makes an unattended sleep-entry sync possible at all. What
+  // WAS wrong is that this loop called each of them exactly once and then slept
+  // the poll interval, so the per-call limit became a per-INTERVAL limit and a
+  // mailbox holding five books took at least five intervals of pure idling on top
+  // of five transfers. Calling them again while items keep landing costs one
+  // manifest round trip per extra item and nothing else.
+  //
+  // THE LOOP ONLY CONTINUES ON A COMPLETION, never on "a target was named". A
+  // window that named a target and did not finish it will name the same target
+  // again, so looping on that is a way to spin against an entry the server will
+  // not serve; the cadence handles the resume case instead, at POLL_WARM_MS. Two
+  // bounds on top of that: MAX_ITEMS_PER_CYCLE on the number of passes and
+  // `drainDeadline` on their total wall clock.
+  //
+  // EVERY DEADLINE IS STILL CAPPED BY THE SESSION DEADLINE. drainDeadline is
+  // deadlineWithin(sessionDeadline, ...), and each window is deadlineWithin() of
+  // THAT, so the min() capping composes: no window can outlive the drain budget
+  // and no drain budget can outlive the session cap.
+  uint32_t drainDeadline = deadlineWithin(sessionDeadline, CYCLE_DRAIN_BUDGET_MS);
+  // 0 is the "no cap" sentinel throughout this stack, so it is stepped over here
+  // for the same reason onEnter steps over it for the session deadline: one tick
+  // of skew once every 49 days, against a cycle that would otherwise run its
+  // passes with the drain bound switched off.
+  if (drainDeadline == 0) drainDeadline = 1;
+
+  // Hoisted out of the loop because the Receiving-state cleanup below reads the
+  // LAST pass's answers: "is the thing currently named on the panel finished, and
+  // did this pass name anything at all".
   bool bookTargetReported = false;
-  BookSync::Progress progress;
-  progress.onTarget = [&](const std::string& filename, size_t bytes, size_t have) {
-    bookTargetReported = true;
-    announceTarget(filename, bytes, have);
-  };
-  progress.shouldAbort = [this] { return pollForAbort(); };
-
-  const bool promoted =
-      BookSync::syncOnLink(base, deadlineWithin(sessionDeadline, BookSync::WINDOW_BUDGET_MS), progress);
-  if (promoted) {
-    booksReceived++;
-    LOG_INF("MSYNCUI", "Book promoted (%d this session)", booksReceived);
-  }
-
-  if (expired(sessionDeadline)) return;
-
-  // ONE WALLPAPER PER POLL, after the books, on its own budget. Last of the three
-  // phases because it is the least latency-sensitive: a note is a message someone
-  // is waiting on, a book is a thing the user asked for, and a wallpaper only has
-  // to be in place by the next time the reader sleeps.
   bool wallpaperTargetReported = false;
-  WallpaperSync::Progress wallpaperProgress;
-  wallpaperProgress.onTarget = [&](const std::string& filename, const bool primary, size_t bytes, size_t have) {
-    wallpaperTargetReported = true;
-    // A primary carries no filename on the wire -- it is a single fixed slot -- so
-    // the panel names it by what it is. WallpaperSync deliberately holds no I18n
-    // table; this is the only place that decision costs anything.
-    announceTarget(primary ? std::string(tr(STR_SYNC_WALLPAPER)) : filename, bytes, have);
-  };
-  wallpaperProgress.shouldAbort = [this] { return pollForAbort(); };
+  bool namedTargetFinished = false;
 
-  const bool wallpaperApplied =
-      WallpaperSync::syncOnLink(base, deadlineWithin(sessionDeadline, WallpaperSync::WINDOW_BUDGET_MS),
-                                wallpaperProgress);
-  if (wallpaperApplied) {
-    wallpapersApplied++;
-    LOG_INF("MSYNCUI", "Wallpaper applied (%d this session)", wallpapersApplied);
+  for (uint8_t item = 0; item < MAX_ITEMS_PER_CYCLE; ++item) {
+    bookTargetReported = false;
+    wallpaperTargetReported = false;
+    namedTargetFinished = false;
+
+    // ONE BOOK PER PASS, by design: BookSync fetches at most one book per call.
+    // The window gets the standard budget capped by what is left of the drain and
+    // therefore of the session, so MIN_USEFUL_MS ("too little budget left to be
+    // worth a window") fires when either is nearly spent.
+    BookSync::Progress progress;
+    progress.onTarget = [&](const std::string& filename, size_t bytes, size_t have) {
+      bookTargetReported = true;
+      announceTarget(filename, bytes, have);
+    };
+    progress.shouldAbort = [this] { return pollForAbort(); };
+
+    const bool promoted =
+        BookSync::syncOnLink(base, deadlineWithin(drainDeadline, BookSync::WINDOW_BUDGET_MS), progress);
+    if (promoted) {
+      booksReceived++;
+      completedSomething = true;
+      LOG_INF("MSYNCUI", "Book promoted (%d this session)", booksReceived);
+    }
+    if (bookTargetReported) namedTargetFinished = promoted;
+
+    // Back was pressed inside the transfer, or the cap landed mid-pass. Either
+    // way there is no second window to start.
+    if (exiting || expired(sessionDeadline)) break;
+
+    // ONE WALLPAPER PER PASS, after the books, on its own budget. Last of the
+    // three phases because it is the least latency-sensitive: a note is a message
+    // someone is waiting on, a book is a thing the user asked for, and a
+    // wallpaper only has to be in place by the next time the reader sleeps.
+    WallpaperSync::Progress wallpaperProgress;
+    wallpaperProgress.onTarget = [&](const std::string& filename, const bool primary, size_t bytes, size_t have) {
+      wallpaperTargetReported = true;
+      // A primary carries no filename on the wire -- it is a single fixed slot -- so
+      // the panel names it by what it is. WallpaperSync deliberately holds no I18n
+      // table; this is the only place that decision costs anything.
+      announceTarget(primary ? std::string(tr(STR_SYNC_WALLPAPER)) : filename, bytes, have);
+    };
+    wallpaperProgress.shouldAbort = [this] { return pollForAbort(); };
+
+    const bool wallpaperApplied = WallpaperSync::syncOnLink(
+        base, deadlineWithin(drainDeadline, WallpaperSync::WINDOW_BUDGET_MS), wallpaperProgress);
+    if (wallpaperApplied) {
+      wallpapersApplied++;
+      completedSomething = true;
+      LOG_INF("MSYNCUI", "Wallpaper applied (%d this session)", wallpapersApplied);
+    }
+    // WHICHEVER PHASE SPOKE LAST OWNS THE SCREEN, which is why this is not simply
+    // `promoted || wallpaperApplied`. A pass that promotes a book and then starts
+    // a wallpaper leaves the wallpaper's name on the panel; clearing on the
+    // book's completion would blank a transfer that is still running.
+    if (wallpaperTargetReported) namedTargetFinished = wallpaperApplied;
+
+    if (!promoted && !wallpaperApplied) break;  // nothing landed: the mailbox is drained
+    if (exiting || expired(drainDeadline) || expired(sessionDeadline)) break;
   }
 
   // A BOOK BIGGER THAN ONE WINDOW STAYS ON THE SCREEN BETWEEN WINDOWS, and that is
@@ -700,23 +850,20 @@ void MailboxSyncActivity::runPollCycle() {
   // Receiving instead, so the only signature change is `have` growing: exactly one
   // repaint per window, showing real progress.
   //
-  // Left when the thing currently named on the panel finishes, or when a cycle
-  // passes without EITHER phase naming a target at all -- which is how "there is
+  // Left when the thing currently named on the panel finishes, or when a pass
+  // goes by without EITHER phase naming a target at all -- which is how "there is
   // nothing left to fetch" arrives, and the only thing that stops a finished
-  // transfer's name from sticking on the panel.
-  //
-  // WHICHEVER PHASE SPOKE LAST OWNS THE SCREEN, which is why this is not simply
-  // `promoted || wallpaperApplied`. A cycle that promotes a book and then starts a
-  // wallpaper leaves the wallpaper's name on the panel and must stay in Receiving;
-  // clearing on the book's completion would blank a transfer that is still running.
-  const bool namedTargetFinished =
-      wallpaperTargetReported ? wallpaperApplied : (bookTargetReported ? promoted : false);
+  // transfer's name from sticking on the panel. Read off the LAST pass of the
+  // drain loop, which is the one whose name is on the panel; `namedTargetFinished`
+  // is maintained inside the loop for exactly that reason.
   if (state == State::Receiving && (namedTargetFinished || (!bookTargetReported && !wallpaperTargetReported))) {
     state = State::Polling;
     targetName.clear();
     targetBytes = 0;
     targetHave = 0;
   }
+
+  return completedSomething ? CycleResult::Moved : CycleResult::Idle;
 }
 
 void MailboxSyncActivity::tryWifiHandoff() {

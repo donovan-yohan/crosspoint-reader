@@ -76,7 +76,32 @@ constexpr char HEALTH_TOKEN[] = "cp-proxy";
 // Per-candidate wall-clock budget. Plain HTTP over a one-hop link with no route
 // anywhere: a real forwarder answers in milliseconds, a dead address fails on
 // connect, and the whole candidate space is AP_MAX_CONNECTIONS wide.
+//
+// "A dead address fails on connect" is true of an address something ANSWERS at.
+// An address inside the AP's subnet that no station holds does NOT fail on
+// connect: lwIP ARPs for it, nobody replies, and the socket waits out the whole
+// budget. That is what made a phone on a later DHCP lease pay every earlier
+// candidate's timeout before its own probe was even sent -- and it is why
+// discoverBase() now derives its candidates from the DHCP lease table when it
+// can, so the dead addresses are simply not in the list.
 constexpr uint32_t CANDIDATE_BUDGET_MS = 1500;
+
+// Per-candidate budget for the first sweeps of a link, while the user is standing
+// over the reader waiting for the app to answer. Callers escalate to
+// CANDIDATE_BUDGET_MS once the fast attempts are spent, so a genuinely slow
+// forwarder is still found -- this trades length for number of attempts, which is
+// the right trade when the thing being waited on is a listener that opens within
+// about a second of association.
+//
+// WHY 1000 AND NOT LESS, WHICH IS THE OBVIOUS THING TO WANT. HttpDownloader
+// clamps every socket timeout it derives from a caller deadline to its
+// MIN_SOCKET_TIMEOUT_MS, which is 1000 ms, because SecureHttpClient divides its
+// timeout by 1000 for the connect phase and a sub-second value rounds to a 0 s
+// connect timeout -- which WiFiClient reads as "fail immediately" rather than "no
+// timeout". A number below 1000 here would be fiction: the deadline would say
+// 400 ms and the socket would still sit on an unanswered candidate for a second.
+// 1000 is the smallest value that means what it says.
+constexpr uint32_t FAST_CANDIDATE_BUDGET_MS = 1000;
 
 // Largest health body the reader will accept. A real answer is ~10 bytes; a
 // candidate that sends more is either not the forwarder or is trying to make the
@@ -99,14 +124,32 @@ bool isProxy(const std::string& origin, uint32_t deadline);
 // forwarder passes /m/* through VERBATIM: one capability URL, one budget, no
 // second settings field (contract section 6).
 //
-// Candidates are derived from WiFi.softAPIP() rather than a hardcoded 192.168.4.x:
-// the firmware never calls softAPConfig, so that subnet is the IDF's default to
-// change, not the reader's to promise. `deadline` is absolute millis() and bounds
-// the whole sweep; each candidate additionally gets at most CANDIDATE_BUDGET_MS.
+// CANDIDATES COME FROM THE DHCP LEASE TABLE WHEN THERE IS ONE, and from the
+// subnet's whole lease range when there is not. The lease table is the exact
+// answer to "which addresses could possibly answer": it is the reader's own DHCP
+// server's record of what it handed out, so a sweep built from it probes the
+// phone and nothing else -- no ARP timeouts for the three addresses nobody holds,
+// which is where essentially all of a failed sweep's wall clock used to go. The
+// fallback keeps working if the lease table cannot be read: addresses are derived
+// from WiFi.softAPIP() rather than a hardcoded 192.168.4.x, because the firmware
+// never calls softAPConfig and that subnet is the IDF's default to change, not
+// the reader's to promise.
+//
+// THE AMBIGUITY REFUSAL IS NOT WEAKENED BY THAT. The lease table holds every
+// station the AP has admitted, and the AP admits at most AP_MAX_CONNECTIONS = 4
+// of them, which is exactly the candidate space the range sweep covers. Narrowing
+// to the leases removes addresses that CANNOT be a forwarder, never one that
+// could -- so "two stations answered, refuse to pick" still sees both.
+//
+// `deadline` is absolute millis() and bounds the whole sweep; each candidate
+// additionally gets at most `candidateBudget`, which callers shorten for the
+// first attempts of a link (FAST_CANDIDATE_BUDGET_MS) and lengthen once those are
+// spent.
 //
 // CALLER'S JOB: wait for WiFi.softAPgetStationNum() > 0 before calling, and bound
 // that wait. Probing an AP no phone has joined yet is four guaranteed failures.
-std::string discoverBase(const std::string& configuredBase, uint32_t deadline, uint16_t port = PROXY_PORT);
+std::string discoverBase(const std::string& configuredBase, uint32_t deadline, uint16_t port = PROXY_PORT,
+                         uint32_t candidateBudget = CANDIDATE_BUDGET_MS);
 
 // Path portion of a mailbox base URL, trailing slashes stripped:
 // "https://host/m/{boxId}" -> "/m/{boxId}", "https://host" -> "". The view aliases

@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_wifi_ap_get_sta_list.h>
 
 #include "network/HttpDownloader.h"
 
@@ -23,6 +25,62 @@ uint32_t deadlineWithin(uint32_t cap, uint32_t budget) {
 }
 
 bool expired(uint32_t deadline) { return deadline != 0 && static_cast<int32_t>(millis() - deadline) >= 0; }
+
+// The addresses the reader's own DHCP server has actually handed out, written to
+// `out` (at most `max`) and returned by count. 0 means "no usable lease table",
+// which is the caller's signal to sweep the whole range instead -- an empty
+// answer is never treated as "nobody is here".
+//
+// WHY THIS EXISTS. Probing an address no station holds is not a fast failure: on
+// a local subnet lwIP ARPs for it, nothing replies, and the connect waits out the
+// whole per-candidate budget. With four addresses in the range and one phone on
+// the link, three quarters of every sweep was spent waiting for machines that do
+// not exist -- and a phone that landed on a later lease paid all of it before its
+// own probe was sent. Asking the DHCP server which addresses are live turns that
+// into one probe.
+//
+// FAILING BACK IS THE ONLY SAFE FAILURE. esp_wifi_ap_get_sta_list_with_ip is
+// documented for the default AP interface with the lwIP DHCP server enabled;
+// anything else (a station associated but with no lease yet, an error, a build
+// without CONFIG_LWIP_DHCPS) yields 0 here and the caller sweeps the range
+// exactly as it always did.
+//
+// The two IDF list structs are ESP_WIFI_MAX_CONN_NUM entries wide -- a few
+// hundred bytes of stack -- so they live in this function and are gone before the
+// caller starts blocking on sockets.
+uint8_t leasedCandidates(const IPAddress& ap, IPAddress* out, const uint8_t max) {
+  wifi_sta_list_t stations{};
+  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK) return 0;
+  if (stations.num <= 0) return 0;
+
+  wifi_sta_mac_ip_list_t leases{};
+  if (esp_wifi_ap_get_sta_list_with_ip(&stations, &leases) != ESP_OK) return 0;
+
+  uint8_t count = 0;
+  for (int i = 0; i < leases.num && count < max; ++i) {
+    // esp_ip4_addr_t.addr is lwIP's network byte order, i.e. the first octet is
+    // the low byte. Unpacked by hand rather than through IPAddress(uint32_t) so
+    // the byte order this depends on is written down where it is relied upon.
+    const uint32_t raw = leases.sta[i].ip.addr;
+    if (raw == 0) continue;  // associated, but the DHCP handshake has not landed
+    const IPAddress ip(static_cast<uint8_t>(raw & 0xFF), static_cast<uint8_t>((raw >> 8) & 0xFF),
+                       static_cast<uint8_t>((raw >> 16) & 0xFF), static_cast<uint8_t>((raw >> 24) & 0xFF));
+
+    // A lease off this AP's own subnet, or one that collides with the AP itself,
+    // is not something to point a capability-free probe at -- and neither can be
+    // produced by a healthy DHCP server, so this is a sanity gate rather than a
+    // security one (the security gate is the health probe itself).
+    if (ip[0] != ap[0] || ip[1] != ap[1] || ip[2] != ap[2]) continue;
+    if (ip[3] == ap[3]) continue;
+
+    bool duplicate = false;
+    for (uint8_t j = 0; j < count; ++j) {
+      if (out[j] == ip) duplicate = true;
+    }
+    if (!duplicate) out[count++] = ip;
+  }
+  return count;
+}
 
 // First non-whitespace token of `body`, so a forwarder may answer with or without
 // a trailing newline and with or without a version suffix.
@@ -74,7 +132,8 @@ bool PeerProbe::isProxy(const std::string& origin, uint32_t deadline) {
   return true;
 }
 
-std::string PeerProbe::discoverBase(const std::string& configuredBase, uint32_t deadline, uint16_t port) {
+std::string PeerProbe::discoverBase(const std::string& configuredBase, uint32_t deadline, uint16_t port,
+                                    uint32_t candidateBudget) {
   const std::string_view path = pathOf(configuredBase);
   if (path.empty()) {
     // Fail closed. A bare origin would make every proxied request miss the
@@ -90,8 +149,8 @@ std::string PeerProbe::discoverBase(const std::string& configuredBase, uint32_t 
     return std::string();
   }
 
-  // THE WHOLE RANGE IS SWEPT, not "the first responder wins", and the sweep
-  // refuses to choose when more than one station answers as a forwarder.
+  // THE WHOLE CANDIDATE SPACE IS SWEPT, not "the first responder wins", and the
+  // sweep refuses to choose when more than one station answers as a forwarder.
   //
   // The health probe proves only that something on this AP speaks five lines of
   // HTTP containing the token "cp-proxy". Returning the first responder meant a
@@ -101,25 +160,43 @@ std::string PeerProbe::discoverBase(const std::string& configuredBase, uint32_t 
   // this code can resolve -- there is nothing to tell the two apart -- so it
   // fails closed and the panel keeps saying "looking for the app", which is the
   // honest thing to show while a second device is squatting the link.
+  //
+  // THE CANDIDATE SPACE IS THE DHCP LEASE TABLE WHEN THERE IS ONE, and the whole
+  // range only as a fallback. That is a LATENCY change and not a security one:
+  // both lists are the same width (MAX_LEASES == AP_MAX_CONNECTIONS), the sweep
+  // below is the same sweep either way, and narrowing to the leases removes
+  // addresses that CANNOT be a forwarder -- never one that could -- so the
+  // refusal above still sees every station that could answer. What it buys is
+  // that a sweep no longer waits out a per-candidate budget on each of the three
+  // addresses nobody holds, which is where nearly all of its wall clock went.
+  IPAddress candidates[MAX_LEASES];
+  uint8_t candidateCount = leasedCandidates(ap, candidates, MAX_LEASES);
+  if (candidateCount == 0) {
+    for (uint8_t i = 0; i < MAX_LEASES; ++i) {
+      const int last = static_cast<int>(ap[3]) + FIRST_LEASE_OFFSET + i;
+      if (last > 254) break;  // ran off the subnet; nothing left to probe
+      candidates[candidateCount++] = IPAddress(ap[0], ap[1], ap[2], static_cast<uint8_t>(last));
+    }
+    LOG_DBG("PEER", "no DHCP lease list; sweeping %u addresses of the range",
+            static_cast<unsigned>(candidateCount));
+  }
+
   std::string found;
-  for (uint8_t i = 0; i < MAX_LEASES; ++i) {
+  for (uint8_t i = 0; i < candidateCount; ++i) {
     if (expired(deadline)) {
       LOG_DBG("PEER", "discovery deadline spent after %u candidates", static_cast<unsigned>(i));
       break;
     }
-    const int last = static_cast<int>(ap[3]) + FIRST_LEASE_OFFSET + i;
-    if (last > 254) break;  // ran off the subnet; nothing left to probe
-    const IPAddress candidate(ap[0], ap[1], ap[2], static_cast<uint8_t>(last));
 
     std::string origin = "http://";
-    origin += candidate.toString().c_str();
+    origin += candidates[i].toString().c_str();
     origin += ":";
     origin += std::to_string(port);
 
     // boxId-free, every time, for every candidate -- see the security note in the
     // header. The capability path is only ever appended AFTER the sweep has
     // settled on exactly one answer.
-    if (isProxy(origin, deadlineWithin(deadline, CANDIDATE_BUDGET_MS))) {
+    if (isProxy(origin, deadlineWithin(deadline, candidateBudget))) {
       if (!found.empty()) {
         LOG_ERR("PEER", "two stations answer as the forwarder; refusing to pick one");
         return std::string();
