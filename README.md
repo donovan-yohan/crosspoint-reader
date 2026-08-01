@@ -10,6 +10,20 @@ CrossPoint is open-source e-reader firmware - community-built, fully hackable, f
 
 > If you're planning to buy an Xteink device, consider purchasing an **X3/X4 Developer Edition** through https://crosspointreader.com. CrossPoint receives a small share of each sale, helping fund development costs.
 
+---
+
+> ### 💌 This fork adds: Lovenote messenger
+>
+> This is a fork of CrossPoint. Everything below is upstream CrossPoint and still applies — the fork adds one thing on
+> top: the reader can **receive notes, books and wallpapers from a phone**, including when the phone is nowhere near it.
+> The newest note becomes the reader's sleep screen for exactly one sleep, then your usual wallpaper comes back.
+>
+> The phone half is a separate app, [**Lovenote**](https://github.com/donovan-yohan/send-to-x4-mobile-app/tree/messenger)
+> (branch `messenger` — that repository's default branch is the unmodified upstream app).
+> With the feature switched off, this firmware behaves exactly like upstream.
+>
+> **→ [Lovenote messenger](#lovenote-messenger-this-fork)** for what it does, what to set, and how to build it.
+
 ## What can CrossPoint do?
 
 - **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling, hyphenation, kerning, chapter navigation, footnotes, bookmarks, dictionary lookups ([StarDict](docs/dictionary.md)), go-to-percent, auto page turn, orientation control, focus reading, KOReader progress sync and more. 
@@ -126,6 +140,183 @@ Convert your own TTF/OTF files into `.cpfont` files that load from the SD card. 
 5. Select the font on the device from the font settings.
 
 Conversion runs the firmware repo's `lib/EpdFont/scripts/fontconvert_sdcard.py` script unmodified, so output matches a local host build.
+
+---
+
+## Lovenote messenger (this fork)
+
+Lovenote is a two-person love-note messenger built on top of CrossPoint. One phone composes a note — a photo, some text, or
+a doodle — and it turns up on the reader as its sleep screen. It also delivers epubs and wallpapers over the same path.
+
+**A note is the sleep screen, once.** A note never renders live and never interrupts: no banner, no toast, no unread badge,
+nothing to dismiss. You set the reader down, the panel paints, and the note is what is on the panel. Pick it back up and
+you are in your book again, as normal. Set it down a second time and your configured wallpaper is back. That reversion is
+keyed on the note id, so a note gets exactly one turn on the panel no matter how many times you sleep and wake.
+
+The phone half lives in its own repository: [**Lovenote**](https://github.com/donovan-yohan/send-to-x4-mobile-app/tree/messenger)
+(Expo / React Native, MIT), on branch **`messenger`** — that repository's default branch is the unmodified upstream app, so
+follow the branch link rather than the bare repo URL. One phone is the **host** — paired with the reader, allowed to change
+its permanent state — and a second phone can be a **client** that only sends. The reader does not care which; it just
+receives.
+
+Everything here is additive: no upstream behaviour is removed or changed, and with **Message Sync** off none of it ever
+brings the radio up on its own.
+
+### What the firmware gains
+
+- **Note delivery on the sleep screen**: a staged frame at `/.love-notes/current.frame` takes the sleep image at the next
+  sleep-entry, once, then the configured wallpaper returns (`src/network/MessageSync.cpp`, `SleepActivity`).
+
+- **A mailbox client**: the reader pulls from a small capability-URL server on its own schedule. There are no acks and no
+  per-device cursor — the server publishes a manifest, the reader diffs it and decides. Two readers can share one mailbox
+  and converge independently.
+
+- **Two unattended sync windows**: one at sleep-entry, and a silent zero-UI check on wake. Both are off unless you turn
+  them on, both are hard-bounded, and both leave the radio off when they finish. See
+  [Sync windows and battery](#sync-windows-and-battery).
+
+- **Two new modes on the File Transfer screen**, alongside Join a Network / Calibre Wireless / Create Hotspot:
+  - **Mailbox Sync** — drain the mailbox now over a saved Wi-Fi network.
+  - **Sync with App** — the reader raises its own access point, your phone joins it, and the phone becomes the mailbox's
+    front door. It can relay over cellular, or serve what it has already queued with **no internet at all**. The web
+    server is deliberately *not* started for this mode, so nothing on the reader is writable from that link.
+
+- **Books**: epubs arrive in `/books` and are readable the moment a sync ends. Fetched one at a time, resumed across
+  windows with HTTP `Range` until the bytes match the manifest exactly. A book that leaves `/books` (you finished it, and
+  the reader moved it to `/read`) is never re-downloaded — diffing is by id, never by filename. Nothing here ever deletes
+  a readable book (`src/network/BookSync.cpp`).
+
+- **Wallpapers**: the sleep-screen wallpaper rides the same mailbox, so it no longer requires being on the same LAN as the
+  reader. Validated as a parseable BMP before it is applied, because the sleep renderer has no user in front of it
+  (`src/network/WallpaperSync.cpp`).
+
+- **Wi-Fi handover from the phone**: a Wi-Fi password is the single worst thing to type on e-ink. While your phone is on
+  the reader's own AP in Sync with App, it can hand a network over the link that is already up (`GET /cp-wifi`, then a
+  `DELETE` acknowledgement). Credentials are only ever *added*, never substituted, and the pickup is refused outright on
+  the saved-network transport — a mailbox host on the internet has no business handing the reader a network.
+
+- **A per-device AP passphrase** for Sync with App: WPA2, minted on the reader, editable, and it survives a settings
+  reset.
+
+### How a note reaches the reader
+
+Three routes, and the reader treats all three as the same thing arriving:
+
+1. **Direct, over your LAN** — phone and reader on the same Wi-Fi, with the reader sitting in File Transfer mode. The app
+   streams the frame straight onto the SD card over the existing web server's WebSocket upload path. Instant, no server
+   involved, but it needs you to be home and the reader to be awake on that screen.
+
+2. **Mailbox** — a tiny capability-URL server that holds the newest note (plus queued books and wallpapers) until the
+   reader asks for it. This is what makes sending from anywhere work: the phone publishes whenever, the reader collects on
+   its own sync windows. Run it as a Cloudflare Worker or self-host the node server; both ship in the app repository.
+
+3. **Peer link** — *Sync with App*. The reader raises its own AP, the phone joins as a peer, and the phone either proxies
+   the mailbox over cellular or serves items straight from its own outbox. The zero-internet route.
+
+Route 2 is the one the unattended windows use. Routes 1 and 3 are things you do on purpose, standing next to the reader.
+
+### Reader settings you have to set
+
+| Setting | Where | What it is |
+| --- | --- | --- |
+| **Message Sync** | On device: **Settings → System** | The master switch for the two unattended windows (sleep-entry sync and the wake check). Off by default. The two manual modes work regardless of this toggle. |
+| **Message sync URL** | Browser only: **File Transfer → web Settings page** (API key `messageSyncUrl`) | Your mailbox base URL, e.g. `https://mailbox.example.com/m/<box-id>`. The firmware appends the contract's own paths to it. Deliberately not on the on-device Settings screen — it is a long URL and e-ink is a terrible keyboard. The app writes it for you during pairing. |
+| **Sync with App passphrase** | On device: **Settings → System** (first row) | The WPA2 passphrase for the reader's own AP in Sync with App. 8–63 printable ASCII characters. Save it **empty** to have the reader mint a fresh one at the next AP session. It is shown on the panel, with a join QR code, while the mode is running. |
+
+Both unattended windows need the toggle **and** a non-empty URL; either one missing and the reader simply does nothing,
+which is why each refusal names itself in the serial log rather than failing silently.
+
+> **Know what the transfer hotspot exposes.** The mailbox URL is a capability URL — the `/m/<box-id>` path is the only
+> thing protecting the notes and books in your mailbox — and it is currently returned unmasked by `GET /api/settings`,
+> which answers anybody who has joined the open File Transfer hotspot. The AP passphrase and the KOReader password *are*
+> masked there. Treat File Transfer mode as something you switch on in a room you control. The reasoning, and what it
+> would take to mask the URL too, is written up at the `messageSyncUrl` entry in `src/SettingsList.h`.
+
+### Sync windows and battery
+
+The design constraint is that the radio is the expensive thing on this device, so it comes up for **seconds at a time**
+and is never left on behind your back.
+
+- **At sleep-entry.** The panel paints the sleep screen *first*, then — if Message Sync is on — the radio comes up: at most
+  6 s to associate with a saved network, a TLS handshake, and one ~100-byte manifest read. With nothing new waiting, that
+  is the whole cost, a couple of seconds, and the radio is off again. The note pass is capped at 10 s on its own; the
+  whole window, including a book or wallpaper transfer riding the same association, is hard-capped at ~28 s
+  (`SLEEP_SYNC_WINDOW_MS` in `src/main.cpp`). That cap is only approached when there are actually bytes to move. Wi-Fi is
+  off when the call returns on every path: success, failure, timeout, no credentials, nothing new.
+
+- **On wake.** A note published while the reader was asleep is collected by a silent, zero-UI check on the next wake that
+  lands at the launcher — never when a book is one keypress away, because Wi-Fi and EPUB rendering must not be resident at
+  once on a chip with ~380 KB of RAM. It stages the frame; the frame takes the panel at the next sleep-entry. One
+  wake→sleep cycle of lag, deliberately accepted as the price of never interrupting you.
+
+- **In the manual modes.** Mailbox Sync and Sync with App hold the radio up and keep the device awake for as long as they
+  run, polling every 4 s, with a hard 30-minute session cap so they cannot outlive a user who walked away. They are a
+  "leave it on the table for a minute" thing, not a background state.
+
+One honest caveat, documented in the code: on an **https** mailbox the wolfSSL handshake caps itself internally at ~15 s
+per attempt and nothing outside it can shorten that, so a host that accepts the TCP connection and then stalls the
+handshake can overrun the budgets above by that much. Everything else — DNS, TCP connect, headers, body, stalls — is
+clamped.
+
+### Build and flash this fork
+
+Same toolchain and prerequisites as [Development quick start](#development-quick-start) — this fork changes no build
+requirements.
+
+```bash
+git clone --recursive https://github.com/donovan-yohan/crosspoint-reader
+cd crosspoint-reader
+
+# if cloned without --recursive:
+git submodule update --init --recursive
+
+# build + flash over USB-C, device awake and unlocked
+pio run --target upload
+```
+
+`default_envs = default` in `platformio.ini`, so no `-e` is needed; `pio run -e default` builds without flashing. The
+artifact lands at `.pio/build/default/firmware.bin`, which you can flash with `esptool` instead if you prefer:
+
+```bash
+esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 .pio/build/default/firmware.bin
+```
+
+Adjust `/dev/ttyACM0` to match your system.
+
+Two things to know before you flash:
+
+- **This fork is not on the web flasher.** https://crosspointreader.com serves official CrossPoint releases only. Build
+  locally, or flash a local `firmware.bin` through the flasher's "Custom .bin" option.
+- **USB-locked devices still apply.** If your unit shipped with USB flashing locked, read
+  [USB-locked devices](#usb-locked-devices-xteink-unlocker) — including the warning — before doing anything.
+
+### Branches
+
+- **`develop`** — the trunk of this fork, and what you want to build. The messenger work is merged here, on top of a
+  current upstream base.
+- **`messenger`** — the feature branch the work arrived on, kept for history.
+- **`upstream`** — the remote pointing at the real project, so the fork can be resynced:
+
+```bash
+git remote add upstream https://github.com/crosspoint-reader/crosspoint-reader.git
+git fetch upstream
+git merge upstream/develop
+```
+
+### Further reading
+
+- [**Lovenote app repository**](https://github.com/donovan-yohan/send-to-x4-mobile-app/tree/messenger) (branch
+  `messenger`; the repo's default branch `main` is the unmodified upstream app) — the phone app, the mailbox server
+  (Cloudflare Worker and a self-hosted node variant), and the reader-link native module.
+- [**`docs/SETUP.md`**](https://github.com/donovan-yohan/send-to-x4-mobile-app/blob/messenger/docs/SETUP.md) in that
+  repository — the full two-repo walkthrough: build the app, stand up a mailbox, pair the reader, send the first note.
+- [**`docs/xteink/mailbox-books-contract.md`**](https://github.com/donovan-yohan/send-to-x4-mobile-app/blob/messenger/docs/xteink/mailbox-books-contract.md)
+  — the wire contracts, if you want to write your own client or server: `latest.txt` / `current.frame` for notes,
+  `books.txt` / `books/{id}`, `wallpaper.txt` / `wallpaper/{id}`, and the peer-link paths `/cp-proxy` and `/cp-wifi`.
+  Section 3A is the lock-screen model in full.
+
+Questions or bugs about the messenger belong on [this fork's issue tracker](https://github.com/donovan-yohan/crosspoint-reader/issues),
+not upstream's — none of it is CrossPoint's to support.
 
 ---
 
